@@ -105,10 +105,25 @@ prove the tool can fail before you take its passing as evidence.
   re-derives each one until it matches. That is how such a claim is
   *discovered*; the forward derivation is how anyone *verifies* it in
   milliseconds afterwards.
-- **`_lib.py`** — shared machinery: base58, the JSON-RPC client, account
-  fetching, the `Cursor` byte reader, PDA derivation, and the `Checks` class
-  that records what was expected next to what was found. Not a checker; it
-  verifies nothing and has no `main()`.
+- **`lp_burn.py`** — pump.fun / PumpSwap: settles *"the LP tokens received on
+  migration were burnt"* at the level of the migration **transaction** rather
+  than of today's balance, because a zero supply now is equally consistent with
+  "burnt at migration" and "burnt last Tuesday". Also settles *"this pool is a
+  graduated pump.fun coin"* by re-deriving the pool creator, which is not the
+  same test as the widely-used `index == 0`.
+- **`burn_history.py`** — *"we have burned N tokens"*: totals every
+  supply-reducing `Burn` / `BurnChecked` instruction authorised by one account
+  for one mint, decoded from the raw instruction bytes. A transfer to a burn
+  address is not a burn and is not counted. Every transaction is read three
+  ways — the instruction bytes, the validator's `preTokenBalances` /
+  `postTokenBalances` record, and the mint's supply — and a disagreement fails
+  the run rather than being averaged.
+- **`_lib.py`** — shared machinery: base58, the JSON-RPC client (single and
+  **batched** — `rpc_batch` puts many calls in one HTTP request, which is the
+  difference between a history walk that takes forty minutes and one that takes
+  one), account fetching, the `Cursor` byte reader, PDA derivation, and the
+  `Checks` class that records what was expected next to what was found. Not a
+  checker; it verifies nothing and has no `main()`.
 
 ---
 

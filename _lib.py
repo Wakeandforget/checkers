@@ -337,6 +337,102 @@ def rpc(method: str, params, url: str = None, timeout: int = 25, attempts: int =
     )
 
 
+def rpc_batch(method: str, params_list, url: str = None, timeout: int = 60,
+              attempts: int = 7, chunk: int = 25, progress=None):
+    """Make the same call many times, batched, and return the results in order.
+
+    JSON-RPC lets a client put several calls in one HTTP request. Solana's
+    public endpoint honours that, and it is the difference between a walk that
+    takes forty minutes and one that takes one: rate limits are counted per
+    request, not per call.
+
+    Returns a list the same length as `params_list`, positionally aligned with
+    it. `None` is a legitimate result for some methods (getTransaction on a
+    signature the endpoint has pruned), so a caller must distinguish "the chain
+    says nothing is there" from "we could not ask" — this function raises for
+    the second case and never fills a gap with a placeholder.
+    """
+    endpoint = url or rpc_url()
+    results = [None] * len(params_list)
+
+    for start in range(0, len(params_list), chunk):
+        window = params_list[start:start + chunk]
+        body = json.dumps([
+            {"jsonrpc": "2.0", "id": i, "method": method, "params": p}
+            for i, p in enumerate(window)
+        ]).encode("utf-8")
+
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            request = urllib.request.Request(
+                endpoint,
+                data=body,
+                headers={
+                    "content-type": "application/json",
+                    "user-agent": "verifier-checkers/1 (+https://wakeandforget.com)",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                last_error = f"HTTP {exc.code}"
+                if exc.code == 429:
+                    # Rate limited. Backing off hard is the whole point of a
+                    # batch walk being polite enough to finish at all.
+                    time.sleep(min(2 ** attempt, 30))
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            else:
+                # A server that does not do batching answers with one object.
+                if not isinstance(payload, list):
+                    raise CheckerError(
+                        f"RPC {method}: {mask_url(endpoint)} did not answer a "
+                        f"batch request with a batch response: {payload!r:.200}"
+                    )
+                if len(payload) != len(window):
+                    raise CheckerError(
+                        f"RPC {method}: asked {mask_url(endpoint)} for "
+                        f"{len(window)} results in one batch and got "
+                        f"{len(payload)}."
+                    )
+                by_id = {}
+                for item in payload:
+                    if "error" in item:
+                        raise CheckerError(
+                            f"RPC {method} refused by {mask_url(endpoint)}: "
+                            f"{item['error']}"
+                        )
+                    if "result" not in item:
+                        raise CheckerError(
+                            f"RPC {method} returned no 'result' member: "
+                            f"{item!r:.200}"
+                        )
+                    by_id[item.get("id")] = item["result"]
+                if set(by_id) != set(range(len(window))):
+                    raise CheckerError(
+                        f"RPC {method}: batch reply ids {sorted(by_id)} do not "
+                        f"match the {len(window)} calls that were sent. The "
+                        "results cannot be lined up with the requests."
+                    )
+                for i in range(len(window)):
+                    results[start + i] = by_id[i]
+                break
+
+            if attempt < attempts:
+                time.sleep(attempt)
+        else:
+            raise CheckerError(
+                f"RPC {method} batch failed after {attempts} attempts against "
+                f"{mask_url(endpoint)}: {last_error}"
+            )
+
+        if progress:
+            progress(min(start + chunk, len(params_list)), len(params_list))
+
+    return results
+
+
 def get_account(address: str, url: str = None) -> dict:
     """Fetch one account. Raises if it does not exist.
 
