@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-multisig.py — check who really controls a Squads multisig wallet.
+multisig.py — check who really controls a multisig wallet on Solana.
 
 CLAIM CLASS: "the treasury is in a N-of-M multisig" — thresholds, member
 lists, member permissions, the vault address, the config authority and the
-time lock of a Squads multisig on Solana mainnet. Both Squads v4 and the
-older Squads v3 (squads-mpl) are decoded; the version is detected from the
-account's owner, never guessed.
+time lock of a multisig on Solana mainnet. Three programs are decoded:
+Squads v4, the older Squads v3 (squads-mpl), and the Anchor/Serum example
+multisig (coral-xyz/multisig) that many 2021-2022 protocols still run on.
+The family is detected from the account's owner, never guessed.
 
 SECOND CLAIM CLASS: "program X is upgradeable only by our multisig". Pass
 --expect-controls-program X and this script resolves X's on-chain upgrade
@@ -31,6 +32,10 @@ several separate claims, and they fail in different ways:
                                       WITHOUT a vote — it quietly undoes the whole
                                       arrangement, and almost nobody checks it)
   * the time lock                    (a delay between approval and execution)
+  * the multisig program itself      (if the multisig PROGRAM is upgradeable,
+                                      whoever holds that authority can deploy new
+                                      logic that signs for the same PDA. Every
+                                      run reports this, either way.)
 
 Everything is decoded from the raw account bytes. No SDK, no explorer API, no
 credentials.
@@ -70,8 +75,28 @@ SQUADS_PROGRAM = "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"
 # "this is not a Squads multisig", which is a wrong answer, not a safe one.
 SQUADS_V3_PROGRAM = "SMPLecH534NA9acpos4G6x7uf3LWbCAwZQE9e8ZekMu"
 
+# The Anchor/Serum example multisig ("serum-multisig", now coral-xyz/multisig).
+# Not a Squads product at all — a separate, much simpler program that a great
+# many 2021-2022 Solana protocols adopted because it was the reference
+# implementation in Anchor's own repository. It still holds program upgrade
+# authority for live protocols. Two properties make it worth decoding here:
+# there are no per-member permissions and no config authority, and the deployed
+# program is itself immutable (checked at run time below, not assumed).
+SERUM_MULTISIG_PROGRAM = "msigmtwzgXJHj2ext4XJjCDmpbcMuufFb5cHuwg6Xdt"
+
 # Which owner means which layout. Nothing is inferred from the address itself.
-SQUADS_PROGRAMS = {SQUADS_PROGRAM: "v4", SQUADS_V3_PROGRAM: "v3"}
+SQUADS_PROGRAMS = {
+    SQUADS_PROGRAM: "v4",
+    SQUADS_V3_PROGRAM: "v3",
+    SERUM_MULTISIG_PROGRAM: "serum",
+}
+
+# Human names for the families, for output and error messages.
+FAMILY_NAMES = {
+    "v4": "Squads v4",
+    "v3": "Squads v3 (squads-mpl)",
+    "serum": "Anchor/Serum multisig (coral-xyz/multisig)",
+}
 
 # A member's permissions are a bitmask: one bit per power.
 #   1 Initiate — may propose a transaction
@@ -79,6 +104,11 @@ SQUADS_PROGRAMS = {SQUADS_PROGRAM: "v4", SQUADS_V3_PROGRAM: "v3"}
 #   4 Execute  — may push an already-approved transaction through
 # A member with Vote but not Execute still counts toward the threshold.
 PERMISSION_BITS = [(1, "Initiate"), (2, "Vote"), (4, "Execute")]
+
+# The genesis hash of Solana mainnet-beta. Checked before anything is read, so
+# that a devnet or forked endpoint cannot quietly supply different bytes for the
+# same addresses.
+MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 
 
 def decode_permissions(mask: int) -> list:
@@ -196,6 +226,161 @@ def decode_multisig_v3(data: bytes) -> dict:
     decoded["timeLock"] = None              # not a v3 feature
     decoded["trailingBytes"] = cursor.remaining
     return decoded
+
+
+def decode_multisig_serum(data: bytes) -> dict:
+    """Decode an Anchor/Serum `Multisig` account from its raw bytes.
+
+    Layout, from the published program source —
+    https://github.com/coral-xyz/multisig, `programs/multisig/src/lib.rs`,
+    `pub struct Multisig` — read in this exact order with no padding:
+
+        vec<[32]> owners           4-byte count, then that many 32-byte keys
+        u64  threshold             signatures needed to execute
+        u8   nonce                 the bump this multisig's signer PDA uses
+        u32  owner_set_seqno       bumped every time the owner set changes;
+                                   any transaction proposed under an older
+                                   sequence number can no longer be approved
+                                   or executed
+
+    Note the owners vector comes FIRST here, before the threshold — the reverse
+    of both Squads layouts. Reading the Squads order into these bytes would
+    yield a plausible-looking threshold made of the first four bytes of
+    somebody's public key, which is exactly the sort of confident nonsense the
+    discriminator check above exists to prevent.
+
+    Two structural differences from Squads, both in the reader's favour and
+    neither of them an omission:
+
+      * No per-member permission mask. Every owner may propose, approve and
+        execute, so the whole owner list counts toward the threshold.
+      * No config authority. `set_owners`, `change_threshold` and
+        `set_owners_and_change_threshold` all take the `Auth` account context,
+        which requires the multisig's own signer PDA as a `Signer`. That PDA
+        can only be produced by `execute_transaction`, which refuses unless
+        `threshold` owners have already approved. So the membership and the
+        threshold can only be changed by the multisig voting to change them.
+        There is no back door of the kind Squads v4's config authority is.
+    """
+    cursor = lib.Cursor(data, label="Multisig(serum)")
+    cursor.expect_discriminator("Multisig")
+
+    owner_count = cursor.u32()
+    if owner_count > 10_000:
+        raise lib.CheckerError(
+            f"owner count reads as {owner_count}, which is absurd. The layout "
+            "assumed here does not match this account."
+        )
+    members = [
+        {"key": cursor.pubkey(), "mask": None,
+         "permissions": ["Initiate", "Vote", "Execute"]}
+        for _ in range(owner_count)
+    ]
+
+    decoded = {
+        "members": members,
+        "threshold": cursor.u64(),
+        "nonce": cursor.u8(),
+        "ownerSetSeqno": cursor.u32(),
+    }
+    decoded["configAuthority"] = None       # cannot exist in this program
+    decoded["timeLock"] = None              # not a feature of this program
+    # This program never stores a transaction counter on the multisig; each
+    # proposal is its own account. Reporting 0 would be a lie, so say nothing.
+    decoded["transactionIndex"] = None
+    decoded["createKey"] = None
+    # The account is allocated with room to grow the owner list, so leftover
+    # bytes are expected here and are NOT evidence of a wrong layout — unlike
+    # in Squads v3, where the account is sized exactly.
+    decoded["trailingBytes"] = cursor.remaining
+    return decoded
+
+
+def decode_transaction_serum(data: bytes) -> dict:
+    """Decode an Anchor/Serum `Transaction` account — one proposal.
+
+    Same source file as the Multisig struct, `pub struct Transaction`:
+
+        [32]  multisig            which multisig this proposal belongs to
+        [32]  program_id          the program it would call
+        vec<TransactionAccount>   34 bytes each: 32-byte key, is_signer, is_writable
+        vec<u8>   data            the raw instruction data it would pass
+        vec<bool> signers         signers[i] is true iff owners[i] approved
+        bool  did_execute         set once, so a proposal cannot run twice
+        u32   owner_set_seqno     the owner set this was proposed under
+
+    Why this is worth decoding rather than trusting a threshold field alone: the
+    Multisig account says how many approvals a proposal *would* need today. This
+    account says how many a specific past action actually *got*, and it survives
+    on chain after execution. That turns "6 of 13 must sign" from a rule into a
+    receipt.
+
+    Note that `signers` is one bool per owner *at the time of proposal*, so its
+    length is the member count that applied then, which is not necessarily the
+    member count now. The two are reported separately for exactly that reason.
+    """
+    cursor = lib.Cursor(data, label="Transaction(serum)")
+    cursor.expect_discriminator("Transaction")
+
+    decoded = {
+        "multisig": cursor.pubkey(),
+        "programId": cursor.pubkey(),
+    }
+
+    account_count = cursor.u32()
+    if account_count > 10_000:
+        raise lib.CheckerError(
+            f"account count reads as {account_count}, which is absurd. The "
+            "layout assumed here does not match this account."
+        )
+    decoded["accounts"] = [
+        {"pubkey": cursor.pubkey(),
+         "isSigner": bool(cursor.u8()),
+         "isWritable": bool(cursor.u8())}
+        for _ in range(account_count)
+    ]
+
+    data_len = cursor.u32()
+    decoded["data"] = cursor.take(data_len).hex()
+
+    signer_count = cursor.u32()
+    if signer_count > 10_000:
+        raise lib.CheckerError(
+            f"signer-flag count reads as {signer_count}, which is absurd. The "
+            "layout assumed here does not match this account."
+        )
+    flags = [bool(cursor.u8()) for _ in range(signer_count)]
+    decoded["signers"] = flags
+    decoded["approvals"] = sum(flags)
+    decoded["ownerSlots"] = signer_count
+    decoded["didExecute"] = bool(cursor.u8())
+    decoded["ownerSetSeqno"] = cursor.u32()
+    decoded["trailingBytes"] = cursor.remaining
+    return decoded
+
+
+def derive_signer_serum(multisig_address: str, nonce: int):
+    """Re-derive the Anchor/Serum multisig's signing PDA, using its own nonce.
+
+    From `execute_transaction` in the program source:
+
+        let seeds = &[multisig_key.as_ref(), &[ctx.accounts.multisig.nonce]];
+
+    One seed — the multisig's own address — and the bump is the `nonce` field
+    stored in the account, not necessarily the canonical bump that
+    find_program_address would return. Deriving with the canonical bump would
+    be right almost always and silently wrong the rest of the time, so the
+    stored nonce is used and the caller is told whether it is canonical.
+
+    Returns (address, nonce_used, is_canonical).
+    """
+    if not 0 <= nonce <= 255:
+        raise lib.CheckerError("nonce must be a single byte")
+    program = lib.parse_pubkey(SERUM_MULTISIG_PROGRAM)
+    seed = lib.parse_pubkey(multisig_address)
+    raw = lib.create_program_address([seed, bytes([nonce])], program)
+    canonical, canonical_bump = lib.find_program_address([seed], program)
+    return lib.b58encode(raw), nonce, (raw == canonical and nonce == canonical_bump)
 
 
 def derive_authority_v3(multisig_address: str, authority_index: int = 1):
@@ -367,7 +552,7 @@ def describe_timelock(seconds: int) -> str:
 
 
 def check(address, expect_threshold=None, expect_members=None, vault_index=None,
-          expect_controls_programs=None, url=None, quiet=False):
+          expect_controls_programs=None, proposals=None, url=None, quiet=False):
     """Run the whole check. Returns (Checks, facts-dict).
 
     Raises CheckerError if it could not get far enough to assert anything —
@@ -377,61 +562,107 @@ def check(address, expect_threshold=None, expect_members=None, vault_index=None,
     checks = lib.Checks()
 
     if not quiet:
-        lib.banner(f"SQUADS MULTISIG CHECK — {address}", url=url, stream=out)
+        lib.banner(f"MULTISIG CHECK — {address}", url=url, stream=out)
+
+    # --- 0. confirm which chain we are even looking at ----------------------
+    # Every address below is meaningful only on mainnet-beta. The same address
+    # on devnet, or on a forked endpoint, holds different bytes — and a wrong
+    # answer that looks right is the worst outcome this script can produce.
+    # This is exit 2 territory, not exit 1: reading the wrong chain does not
+    # make anybody's claim false, it makes this run worthless.
+    genesis = lib.rpc("getGenesisHash", [], url=url)
+    if genesis != MAINNET_GENESIS:
+        raise lib.CheckerError(
+            f"this endpoint reports genesis hash {genesis}, which is not "
+            f"Solana mainnet-beta ({MAINNET_GENESIS}). Refusing to report "
+            "mainnet addresses from some other chain."
+        )
+    checks.expect("the endpoint really is Solana mainnet-beta (genesis hash)",
+                  genesis, MAINNET_GENESIS)
 
     # --- 1. fetch and confirm what kind of account this is ------------------
     account = lib.get_account(address, url=url)
 
-    # If this is not owned by a Squads program then it is not a Squads
-    # multisig, whatever anyone calls it. Assert rather than assume.
+    # If this is not owned by a multisig program this script understands, then
+    # its bytes mean nothing here, whatever anyone calls the account. Assert
+    # rather than assume.
     version = SQUADS_PROGRAMS.get(account["owner"])
     checks.expect_true(
-        "the account is owned by a Squads program (v4 or v3)",
+        "the account is owned by a multisig program this checker can decode "
+        "(Squads v4, Squads v3, or the Anchor/Serum multisig)",
         version is not None,
         f"owner is {account['owner']}"
-        + (f" — Squads {version}" if version else " — not a Squads program"),
+        + (f" — {FAMILY_NAMES[version]}" if version else " — not a known multisig program"),
     )
     if version is None:
-        # Decoding foreign bytes with the Squads layout would produce garbage
-        # that looks like data. Stop here and say why.
+        # Decoding foreign bytes with a known layout would produce garbage that
+        # looks like data. Stop here and say why.
+        known = ", ".join(f"{FAMILY_NAMES[v]} ({p})" for p, v in SQUADS_PROGRAMS.items())
         raise lib.CheckerError(
-            f"{address} is owned by {account['owner']}, which is neither the "
-            f"Squads v4 program ({SQUADS_PROGRAM}) nor the Squads v3 program "
-            f"({SQUADS_V3_PROGRAM}). This is not a Squads multisig account."
+            f"{address} is owned by {account['owner']}, which is none of the "
+            f"multisig programs this script can decode: {known}."
         )
 
+    serum_canonical_nonce = None
     if version == "v4":
         multisig = decode_multisig(account["data"])
         # v4 vaults are indexed from 0.
         signer_index = 0 if vault_index is None else vault_index
-    else:
+    elif version == "v3":
         multisig = decode_multisig_v3(account["data"])
         # v3's default vault is authority index 1, not 0. Defaulting to 0 here
         # would derive a real-looking address that holds nothing.
         signer_index = 1 if vault_index is None else vault_index
+    else:
+        multisig = decode_multisig_serum(account["data"])
+        # This program has exactly one signing PDA per multisig — there is no
+        # index at all. Silently ignoring a --vault-index would let a reader
+        # think they had checked a vault that does not exist.
+        if vault_index not in (None, 0):
+            raise lib.CheckerError(
+                "the Anchor/Serum multisig has exactly one signer PDA per "
+                f"multisig, so --vault-index {vault_index} has no meaning here"
+            )
+        signer_index = 0
 
     # --- 2. report the facts -----------------------------------------------
-    vault_address, vault_bump = derive_signer(address, version, signer_index)
+    if version == "serum":
+        vault_address, vault_bump, serum_canonical_nonce = derive_signer_serum(
+            address, multisig["nonce"])
+    else:
+        vault_address, vault_bump = derive_signer(address, version, signer_index)
     config_authority = multisig["configAuthority"]
     # In v3 the field cannot exist; in v4, "unset" is written as the system program.
     authority_is_none = (config_authority is None
                          or config_authority == lib.SYSTEM_PROGRAM)
 
+    # Who, if anyone, can replace the multisig program's own code. If that
+    # authority is set, every guarantee below is only as good as whoever holds
+    # it: they can deploy a new program that signs for the same PDA. Almost
+    # nobody checks this, and it is one account lookup.
+    try:
+        program_control = spl_mint.program_upgrade_authority(account["owner"], url=url)
+        program_authority = program_control.get("upgradeAuthority")
+    except lib.CheckerError as exc:
+        program_control = {"error": str(exc)}
+        program_authority = "unknown"
+
     if not quiet:
-        print(f"  squads version     {version}", file=out)
+        print(f"  multisig family    {FAMILY_NAMES[version]}", file=out)
         print(f"  threshold          {multisig['threshold']} of {len(multisig['members'])}",
               file=out)
         print(f"  members            {len(multisig['members'])}", file=out)
         if multisig["timeLock"] is None:
-            print("  time lock          n/a — Squads v3 has no time lock feature",
-                  file=out)
+            print(f"  time lock          n/a — {FAMILY_NAMES[version]} has no "
+                  "time lock feature", file=out)
         else:
             print(f"  time lock          {describe_timelock(multisig['timeLock'])}",
                   file=out)
         if config_authority is None:
-            print("  config authority   n/a — Squads v3 has no config-authority field, "
-                  "so members\n                     and threshold can only change "
-                  "through a multisig transaction", file=out)
+            print(f"  config authority   n/a — {FAMILY_NAMES[version]} has no "
+                  "config-authority field, so\n                     members and "
+                  "threshold can only change through a multisig transaction",
+                  file=out)
         else:
             print(f"  config authority   "
                   f"{'none — members and threshold can only change by a vote' if authority_is_none else config_authority}",
@@ -440,35 +671,66 @@ def check(address, expect_threshold=None, expect_members=None, vault_index=None,
             print("                     ^ THIS ACCOUNT CAN CHANGE THE MEMBERS AND THE",
                   file=out)
             print("                       THRESHOLD WITHOUT A VOTE.", file=out)
-        label = "vault" if version == "v4" else "authority"
-        print(f"  {label} (index {signer_index})  {vault_address}  (bump {vault_bump})",
-              file=out)
-        print(f"                     re-derived here, not read from an explorer",
-              file=out)
-        print(f"  transactions       {multisig['transactionIndex']} proposed to date",
-              file=out)
+        if version == "serum":
+            print(f"  signer PDA         {vault_address}  (nonce {vault_bump}"
+                  f"{'' if serum_canonical_nonce else ', NOT the canonical bump'})",
+                  file=out)
+            print(f"                     re-derived here, not read from an explorer",
+                  file=out)
+            print(f"  owner_set_seqno    {multisig['ownerSetSeqno']} — the owner "
+                  "list has been changed this\n                     many times "
+                  "since the multisig was created", file=out)
+        else:
+            label = "vault" if version == "v4" else "authority"
+            print(f"  {label} (index {signer_index})  {vault_address}  (bump {vault_bump})",
+                  file=out)
+            print(f"                     re-derived here, not read from an explorer",
+                  file=out)
+        if multisig["transactionIndex"] is not None:
+            print(f"  transactions       {multisig['transactionIndex']} proposed to date",
+                  file=out)
+        print(f"  multisig program   {account['owner']}", file=out)
+        if program_authority is None:
+            print("                     IMMUTABLE — nobody can replace this "
+                  "program's code", file=out)
+        else:
+            print(f"                     *** UPGRADEABLE BY {program_authority} — "
+                  "that account can\n                     replace the multisig "
+                  "logic itself ***", file=out)
         print(f"  account            {account['lamports']} lamports of rent, "
               f"{len(account['data'])} bytes", file=out)
         print("", file=out)
         print("  MEMBERS", file=out)
         for member in multisig["members"]:
             if member["mask"] is None:
-                print(f"    {member['key']}  (v3: every member may propose, "
+                print(f"    {member['key']}  (every member may propose, "
                       f"vote and execute)", file=out)
             else:
                 print(f"    {member['key']}  mask={member['mask']} "
                       f"{'+'.join(member['permissions']) or 'NO PERMISSIONS'}", file=out)
 
-    checks.observe("squads version", version)
+    checks.observe("multisig family", FAMILY_NAMES[version])
     checks.observe("threshold", multisig["threshold"])
     checks.observe("member count", len(multisig["members"]))
     checks.observe("signer PDA (derived)", vault_address)
     checks.observe("config authority",
-                   "n/a (v3 has no such field)" if config_authority is None
-                   else config_authority)
+                   f"n/a ({FAMILY_NAMES[version]} has no such field)"
+                   if config_authority is None else config_authority)
     checks.observe("time lock (seconds)",
-                   "n/a (v3 has no time lock)" if multisig["timeLock"] is None
-                   else multisig["timeLock"])
+                   f"n/a ({FAMILY_NAMES[version]} has no time lock)"
+                   if multisig["timeLock"] is None else multisig["timeLock"])
+    if version == "serum":
+        checks.observe("owner_set_seqno (times the owner list has changed)",
+                       multisig["ownerSetSeqno"])
+    # An observation, not an assertion, for the same reason a threshold of 1 is:
+    # an upgradeable multisig program is a true fact about the arrangement, not
+    # a false claim by anyone. But it is the fact that decides how much the rest
+    # of this output is worth, so it is stated either way.
+    checks.observe(
+        "the multisig program's own upgrade authority — whoever holds it can "
+        "replace the multisig logic and sign for the same PDA",
+        "none — the program is immutable" if program_authority is None
+        else str(program_authority))
 
     # --- 3. structural assertions, made on every run ------------------------
     # These hold for any honest Squads multisig, so they are checked whether or
@@ -536,6 +798,28 @@ def check(address, expect_threshold=None, expect_members=None, vault_index=None,
             f"{len(multisig['members'])} members",
         )
 
+    if version == "serum":
+        # The signer PDA above was derived with the nonce stored in the account,
+        # because that is the bump the program signs with. Whether that is also
+        # the canonical bump is a separate question, and the answer belongs in
+        # the output rather than in an assumption. Every honest deployment uses
+        # the canonical one; a non-canonical nonce is not proof of anything bad,
+        # but a reader comparing this address against find_program_address by
+        # hand would otherwise get a different answer and not know why.
+        checks.expect_true(
+            "the signer PDA derives from the multisig's own address with the "
+            "nonce stored in the account, and that nonce is the canonical bump",
+            bool(serum_canonical_nonce),
+            f"nonce {multisig['nonce']}"
+            + ("" if serum_canonical_nonce
+               else " — NOT canonical; find_program_address returns a different "
+                    "address, and only this one can sign"),
+        )
+        # Sized with room to grow the owner list, so leftover bytes are normal
+        # here and prove nothing either way. Reported, not asserted.
+        checks.observe("bytes left unused after the owner list",
+                       multisig["trailingBytes"])
+
     # --- 4. the caller's assertions ----------------------------------------
     if expect_threshold is not None:
         checks.expect("the threshold is the claimed value",
@@ -586,15 +870,90 @@ def check(address, expect_threshold=None, expect_members=None, vault_index=None,
             print(f"      last deploy slot {result['lastDeployedSlot']} — {state}",
                   file=out)
 
+    # --- 6. "and here is a proposal it actually executed" -------------------
+    # The threshold above is a rule about the future. A proposal account is a
+    # receipt from the past, and it stays on chain after execution. Checking one
+    # is how "6 of 13 must sign" stops being a promise and becomes a record.
+    decoded_proposals = []
+    for proposal_address in (proposals or []):
+        if version != "serum":
+            raise lib.CheckerError(
+                "--proposal decodes the Anchor/Serum multisig's Transaction "
+                f"accounts; this multisig is {FAMILY_NAMES[version]}"
+            )
+        proposal_account = lib.get_account(proposal_address, url=url)
+        if proposal_account["owner"] != account["owner"]:
+            raise lib.CheckerError(
+                f"{proposal_address} is owned by {proposal_account['owner']}, "
+                f"not by {account['owner']} — it is not a proposal of this "
+                "multisig's program"
+            )
+        proposal = decode_transaction_serum(proposal_account["data"])
+        proposal["address"] = proposal_address
+        decoded_proposals.append(proposal)
+
+        checks.expect(
+            f"proposal {proposal_address} belongs to this multisig",
+            proposal["multisig"], address)
+        # Only meaningful for one that ran: an unexecuted proposal is allowed
+        # to be short of approvals, that is what "pending" means.
+        if proposal["didExecute"]:
+            checks.expect_true(
+                f"proposal {proposal_address} was executed with at least "
+                f"`threshold` approvals recorded on chain",
+                proposal["approvals"] >= multisig["threshold"],
+                f"{proposal['approvals']} of {proposal['ownerSlots']} owner "
+                f"slots approved; threshold is {multisig['threshold']}",
+            )
+        checks.observe(f"proposal {proposal_address}: approvals recorded",
+                       f"{proposal['approvals']} of {proposal['ownerSlots']}")
+        checks.observe(f"proposal {proposal_address}: executed",
+                       proposal["didExecute"])
+        # A proposal made under an older owner set can no longer be approved or
+        # executed — the program compares these two numbers and refuses. Worth
+        # showing rather than leaving the reader to wonder.
+        checks.observe(
+            f"proposal {proposal_address}: owner_set_seqno",
+            f"{proposal['ownerSetSeqno']} (multisig is now at "
+            f"{multisig['ownerSetSeqno']}"
+            + ("" if proposal["ownerSetSeqno"] == multisig["ownerSetSeqno"]
+               else "; this proposal is void and can never execute") + ")")
+
+    if decoded_proposals and not quiet:
+        print("", file=out)
+        print("  PROPOSALS DECODED", file=out)
+        for proposal in decoded_proposals:
+            print(f"    {proposal['address']}", file=out)
+            print(f"      calls        {proposal['programId']}", file=out)
+            print(f"      ix data      0x{proposal['data'] or '(empty)'}", file=out)
+            print(f"      approvals    {proposal['approvals']} of "
+                  f"{proposal['ownerSlots']} owner slots  "
+                  f"(threshold {multisig['threshold']})", file=out)
+            print(f"      executed     {proposal['didExecute']}", file=out)
+            print(f"      seqno        {proposal['ownerSetSeqno']}", file=out)
+            print(f"      who approved (index into the owner list at the time):",
+                  file=out)
+            for index, did in enumerate(proposal["signers"]):
+                if did:
+                    key = (multisig["members"][index]["key"]
+                           if index < len(multisig["members"]) else "(owner list has changed)")
+                    print(f"        [{index:>2}] {key}", file=out)
+
     facts = {
         "checkedAt": lib.utc_now(),
         "rpc": lib.mask_url(url or lib.rpc_url()),
         "multisigAddress": address,
+        "proposals": decoded_proposals,
         "squadsVersion": version,
+        "multisigFamily": FAMILY_NAMES[version],
         "squadsProgram": account["owner"],
         "owner": account["owner"],
+        "multisigProgramUpgradeAuthority": program_authority,
+        "multisigProgramControl": program_control,
         "vault": {"index": signer_index, "address": vault_address,
-                  "bump": vault_bump},
+                  "bump": vault_bump,
+                  "canonicalBump": None if version != "serum"
+                                   else bool(serum_canonical_nonce)},
         "configAuthority": None if authority_is_none else config_authority,
         "multisig": multisig,
         "programsControlled": controls,
@@ -646,6 +1005,27 @@ V3_CONTROLLED_PROGRAM = "SP12tWFxD9oJsVWNavTTBZvMbA6gkAmxtVgxdqvyvhY"
 # A program with NO upgrade authority at all. Claiming a multisig controls it
 # must fail — "immutable" is not "controlled by you", however safe it sounds.
 IMMUTABLE_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+# A real Anchor/Serum multisig: the one holding the upgrade authority of
+# Marinade's liquid staking program, identified in wake 6 by reading the
+# program's own last upgrade transaction
+# (wyCLBNG716ScBE1rAU7FC2EmqHJxcho3LCofb2vLBcCDxVfXn6SF8b3gfjda1cUEhdYeKwbF2j4AmhimxNA9PUh)
+# rather than by guessing.
+#
+# As with the v3 constants: the OFFLINE controls are PDA arithmetic and cannot
+# rot. The ONLINE controls assert only that the account decodes and that
+# impossible claims fail — never a live threshold or member count — so Marinade
+# reconfiguring its multisig will not make this self-test report itself broken.
+SERUM_MULTISIG = "magrsHFQxkkioAy45VWnZnFBBdKVdy2ZiRoRGYT9Wed"
+SERUM_SIGNER = "551FBXSXdhcRDDkdcb3ThDRg84Mwe5Zs6YjJ1EEoyzBp"
+SERUM_NONCE = 253
+SERUM_CONTROLLED_PROGRAM = "MarBmsSgKXdrN1egZf5sqe1TMai9K1rChYNDJgjq7aD"
+
+# The proposal account that performed that program's most recent upgrade. It
+# has already executed, and an executed proposal is never written again, so
+# these two numbers are as fixed as a confirmed transaction is.
+SERUM_EXECUTED_PROPOSAL = "C2kiVNvbGaXE31M9fqMdaSEH8sUPMAB78pNwsYWP8L1m"
+SERUM_PROPOSAL_APPROVALS = 6
 
 
 def self_test(url=None) -> int:
@@ -852,6 +1232,172 @@ def self_test(url=None) -> int:
         record("KNOWN-BAD: an immutable program is not reported as controlled",
                False, str(exc), blocked=True)
 
+    # -- Control 17: offline. The Anchor/Serum signer PDA must reproduce a
+    #    known address exactly, derived with the account's stored nonce.
+    try:
+        derived, nonce, canonical = derive_signer_serum(SERUM_MULTISIG, SERUM_NONCE)
+        record("serum signer PDA derivation matches a known address",
+               derived == SERUM_SIGNER,
+               f"derived {derived} (nonce {nonce}, canonical={canonical}), "
+               f"expected {SERUM_SIGNER}")
+    except lib.CheckerError as exc:
+        record("serum signer PDA derivation matches a known address", False, str(exc))
+
+    # -- Control 18: offline, NEGATIVE. The nonce is load-bearing. A different
+    #    nonce must give a different address, or "this is the signer" would be
+    #    unfalsifiable.
+    try:
+        wrong_nonce = SERUM_NONCE - 1
+        other = None
+        while wrong_nonce >= 0 and other is None:
+            try:
+                other, _, _ = derive_signer_serum(SERUM_MULTISIG, wrong_nonce)
+            except lib.CheckerError:
+                wrong_nonce -= 1     # that bump lands on the curve; try the next
+        record("KNOWN-BAD: a different nonce yields a different serum signer PDA",
+               other is not None and other != SERUM_SIGNER,
+               f"nonce {wrong_nonce} -> {other}, which differs from nonce "
+               f"{SERUM_NONCE} -> {SERUM_SIGNER}")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: a different nonce yields a different serum signer PDA",
+               False, str(exc))
+
+    # -- Control 19: offline, NEGATIVE. The Squads seed schemes applied to a
+    #    serum multisig must NOT produce its signer. Three families now share
+    #    one code path; this is what stops them being silently interchangeable.
+    try:
+        v4_style, _ = derive_vault(SERUM_MULTISIG, 0)
+        v3_style, _ = derive_authority_v3(SERUM_MULTISIG, 1)
+        record("KNOWN-BAD: Squads seed schemes do not reproduce a serum signer",
+               v4_style != SERUM_SIGNER and v3_style != SERUM_SIGNER,
+               f"v4-style gives {v4_style}, v3-style gives {v3_style}, "
+               f"neither is {SERUM_SIGNER}")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: Squads seed schemes do not reproduce a serum signer",
+               False, str(exc))
+
+    # -- Control 20: offline, NEGATIVE. The owners vector comes first in this
+    #    layout and last in Squads v3. Feeding v3 bytes to the serum decoder
+    #    must raise rather than invent a threshold out of somebody's pubkey.
+    try:
+        fake = (lib.anchor_discriminator("Multisig")
+                + (3).to_bytes(4, "little") + bytes(32) * 2)   # says 3 owners, has 2
+        try:
+            decode_multisig_serum(fake)
+            record("KNOWN-BAD: truncated serum bytes are refused, not guessed at",
+                   False, "the decoder returned a result from short data")
+        except lib.CheckerError as exc:
+            record("KNOWN-BAD: truncated serum bytes are refused, not guessed at",
+                   True, f"refused with: {str(exc)[:90]}")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: truncated serum bytes are refused, not guessed at",
+               False, str(exc))
+
+    # -- Control 21: online, POSITIVE. A live serum multisig must decode and
+    #    pass its structural assertions. Asserts nothing that can rot.
+    try:
+        checks, facts = check(SERUM_MULTISIG, url=url, quiet=True)
+        code = checks.exit_code()
+        record("KNOWN-GOOD: a live Anchor/Serum multisig decodes and passes",
+               code == 0 and facts["squadsVersion"] == "serum",
+               f"exit code {code} (wanted 0), detected family "
+               f"{facts['squadsVersion']} (wanted serum)")
+    except lib.CheckerError as exc:
+        record("KNOWN-GOOD: a live Anchor/Serum multisig decodes and passes",
+               False, str(exc), blocked=True)
+
+    # -- Control 22: online, NEGATIVE. An impossible threshold must fail,
+    #    whatever the real one is.
+    try:
+        checks, _ = check(SERUM_MULTISIG, expect_threshold=9999, url=url, quiet=True)
+        code = checks.exit_code()
+        record("KNOWN-BAD: an impossible serum threshold claim produces exit 1",
+               code == 1, f"exit code {code} (wanted 1)")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: an impossible serum threshold claim produces exit 1",
+               False, str(exc), blocked=True)
+
+    # -- Control 23: online, NEGATIVE. An impossible member count must fail.
+    try:
+        checks, _ = check(SERUM_MULTISIG, expect_members=9999, url=url, quiet=True)
+        code = checks.exit_code()
+        record("KNOWN-BAD: an impossible serum member count produces exit 1",
+               code == 1, f"exit code {code} (wanted 1)")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: an impossible serum member count produces exit 1",
+               False, str(exc), blocked=True)
+
+    # -- Control 24: online, POSITIVE. The program-control link must hold for
+    #    a program known to be under this serum multisig.
+    try:
+        checks, _ = check(SERUM_MULTISIG,
+                          expect_controls_programs=[SERUM_CONTROLLED_PROGRAM],
+                          url=url, quiet=True)
+        code = checks.exit_code()
+        record("KNOWN-GOOD: a program really under the serum multisig passes",
+               code == 0, f"exit code {code} (wanted 0)")
+    except lib.CheckerError as exc:
+        record("KNOWN-GOOD: a program really under the serum multisig passes",
+               False, str(exc), blocked=True)
+
+    # -- Control 25: online, NEGATIVE. That same program claimed for a
+    #    DIFFERENT multisig must fail.
+    try:
+        checks, _ = check(V3_MULTISIG,
+                          expect_controls_programs=[SERUM_CONTROLLED_PROGRAM],
+                          url=url, quiet=True)
+        code = checks.exit_code()
+        record("KNOWN-BAD: that program claimed for the wrong multisig fails",
+               code == 1, f"exit code {code} (wanted 1)")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: that program claimed for the wrong multisig fails",
+               False, str(exc), blocked=True)
+
+    # -- Control 26: offline, NEGATIVE. The proposal decoder must refuse bytes
+    #    that are not a Transaction account, rather than reading a pubkey as an
+    #    approval count.
+    try:
+        try:
+            decode_transaction_serum(lib.anchor_discriminator("Multisig") + bytes(200))
+            record("KNOWN-BAD: non-proposal bytes are refused by the proposal decoder",
+                   False, "the decoder accepted a Multisig discriminator")
+        except lib.CheckerError as exc:
+            record("KNOWN-BAD: non-proposal bytes are refused by the proposal decoder",
+                   True, f"refused with: {str(exc)[:90]}")
+    except Exception as exc:                     # noqa: BLE001 - controls must not crash the run
+        record("KNOWN-BAD: non-proposal bytes are refused by the proposal decoder",
+               False, repr(exc))
+
+    # -- Control 27: online, POSITIVE. The pinned proposal — the one that
+    #    performed Marinade's most recent program upgrade — must decode, and
+    #    the approvals it recorded must meet the threshold. This is pinned to a
+    #    proposal account that has already executed, so it cannot change.
+    try:
+        checks, facts = check(SERUM_MULTISIG, proposals=[SERUM_EXECUTED_PROPOSAL],
+                              url=url, quiet=True)
+        proposal = facts["proposals"][0]
+        code = checks.exit_code()
+        record("KNOWN-GOOD: an executed proposal decodes with enough approvals",
+               code == 0 and proposal["didExecute"]
+               and proposal["approvals"] == SERUM_PROPOSAL_APPROVALS,
+               f"exit code {code} (wanted 0), approvals {proposal['approvals']} "
+               f"(wanted {SERUM_PROPOSAL_APPROVALS}), executed "
+               f"{proposal['didExecute']} (wanted True)")
+    except lib.CheckerError as exc:
+        record("KNOWN-GOOD: an executed proposal decodes with enough approvals",
+               False, str(exc), blocked=True)
+
+    # -- Control 28: online, NEGATIVE. An account that is not a proposal of this
+    #    multisig must be refused, not decoded. Passing the multisig's own
+    #    address is the cheapest way to try to fool it.
+    try:
+        check(SERUM_MULTISIG, proposals=[SERUM_MULTISIG], url=url, quiet=True)
+        record("KNOWN-BAD: a non-proposal account is refused as a proposal",
+               False, "the checker decoded the multisig account as a proposal")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: a non-proposal account is refused as a proposal",
+               True, f"refused with: {str(exc)[:90]}")
+
     # -- Verdict ------------------------------------------------------------
     wrong = [r for r in results if not r["ok"] and not r["blocked"]]
     blocked = [r for r in results if r["blocked"]]
@@ -879,8 +1425,8 @@ def self_test(url=None) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Check the threshold, members, vault and authority of a "
-                    "Squads v4 multisig on Solana.",
+        description="Check the threshold, members, signer PDA and authority of a "
+                    "Squads v4, Squads v3 or Anchor/Serum multisig on Solana.",
         epilog="Exit 0 = all assertions held, 1 = an assertion is false, "
                "2 = could not check.",
     )
@@ -893,11 +1439,18 @@ def main() -> int:
     parser.add_argument("--vault-index", type=int, default=None, metavar="N",
                         help="which vault/authority PDA to derive (default: 0 "
                              "for Squads v4, 1 for Squads v3, each being that "
-                             "version's first vault)")
+                             "version's first vault; the Anchor/Serum multisig "
+                             "has exactly one signer PDA and takes no index)")
     parser.add_argument("--expect-controls-program", metavar="PROGRAM_ID",
                         action="append", dest="expect_controls_programs",
                         help="assert this program's on-chain upgrade authority "
                              "is this multisig's signer PDA. Repeatable.")
+    parser.add_argument("--proposal", metavar="ADDRESS",
+                        action="append", dest="proposals",
+                        help="decode a proposal (Transaction) account of this "
+                             "multisig and report how many owners actually "
+                             "approved it. Anchor/Serum multisigs only. "
+                             "Repeatable.")
     parser.add_argument("--find-multisig", metavar="AUTHORITY",
                         help="search mode: given a signing PDA, find the multisig "
                              "it belongs to by enumerating every Squads multisig "
@@ -960,6 +1513,7 @@ def main() -> int:
             expect_members=args.expect_members,
             vault_index=args.vault_index,
             expect_controls_programs=args.expect_controls_programs,
+            proposals=args.proposals,
             url=args.rpc,
         )
     except lib.CheckerError as exc:

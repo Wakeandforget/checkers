@@ -201,6 +201,41 @@ def find_program_address(seeds, program_id: bytes):
     raise CheckerError("no off-curve address found for these seeds")
 
 
+def create_program_address(seeds, program_id: bytes) -> bytes:
+    """Solana's createProgramAddress: the derivation for one *given* bump.
+
+    find_program_address() searches downward from 255 and returns the first
+    off-curve result — the "canonical" bump. But a program is free to sign with
+    any bump it has stored, and several older programs (Anchor's example
+    multisig among them) keep a `nonce` field and sign with that. Deriving with
+    the canonical bump when the program signs with a stored one would produce a
+    real-looking address that is not the one that can actually sign.
+
+    So: derive with the bump the program says it uses, and check separately
+    whether that is also the canonical one. Raises if the result is on the
+    curve, because such an address is not a valid PDA and nothing can sign for
+    it.
+    """
+    if not isinstance(program_id, (bytes, bytearray)) or len(program_id) != 32:
+        raise CheckerError("create_program_address needs a 32-byte program id")
+    digest = hashlib.sha256()
+    for seed in seeds:
+        if not isinstance(seed, (bytes, bytearray)):
+            raise CheckerError(f"seed must be bytes, got {type(seed).__name__}")
+        if len(seed) > 32:
+            raise CheckerError("a PDA seed may be at most 32 bytes")
+        digest.update(seed)
+    digest.update(program_id)
+    digest.update(PDA_MARKER)
+    candidate = digest.digest()
+    if is_on_curve(candidate):
+        raise CheckerError(
+            "these seeds hash to a point on the ed25519 curve, so the result is "
+            "not a valid program-derived address"
+        )
+    return candidate
+
+
 def anchor_discriminator(account_name: str) -> bytes:
     """The 8-byte tag Anchor programs put at the start of every account.
 
