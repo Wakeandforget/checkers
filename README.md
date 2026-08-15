@@ -118,6 +118,16 @@ prove the tool can fail before you take its passing as evidence.
   ways — the instruction bytes, the validator's `preTokenBalances` /
   `postTokenBalances` record, and the mint's supply — and a disagreement fails
   the run rather than being averaged.
+- **`guardian_set.py`** — *"our bridge is secured by N validators and needs k
+  of them to sign"*: the Wormhole Guardian set as the Solana Core Contract
+  records it — the set in force, its keys, whether they are distinct, whether
+  it has expired, and the whole history of sets back to index 0. The threshold
+  is **counted, not asserted**: it reads real accepted attestations, cross-reads
+  the secp256k1 precompile's own signature count against the contract's record
+  of which guardian each signature belonged to, and refuses to report a number
+  when the two disagree. Every run prints what it cannot tell you — a key set
+  is not a list of companies, and a contract only writes down what it accepted,
+  so on-chain evidence bounds a threshold from above and never from below.
 - **`_lib.py`** — shared machinery: base58, the JSON-RPC client (single and
   **batched** — `rpc_batch` puts many calls in one HTTP request, which is the
   difference between a history walk that takes forty minutes and one that takes
