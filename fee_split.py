@@ -826,13 +826,23 @@ def report_trajectory(walk: dict, checks: Checks, require_monotonic: bool) -> No
               f"{last['signature']}")
         print(f"    fell between checkpoints: {one['falls']} times")
         widest = max(widest, one["largest_gap"])
+        # Drill windows are inclusive of both endpoints, so two consecutive
+        # falls share a transaction and the same outflow appears in both
+        # windows. The stored data is right; printing it twice would make a
+        # reader count the same transfer twice, so print each signature once.
+        seen = set()
         for drill in one["drilled"]:
             if "skipped" in drill:
                 print(f"      window {drill['window']}: {drill['skipped']}")
                 continue
             for outflow in drill["outflows"]:
+                if outflow["signature"] in seen:
+                    continue
+                seen.add(outflow["signature"])
                 print(f"      OUT {outflow['amount']/10**decimals:,.6f} in "
                       f"{outflow['signature']}")
+        if seen:
+            print(f"      {len(seen)} distinct outgoing transaction(s) named above")
     print("")
     print("  What this does and does not settle: the balance at each checkpoint is")
     print(f"  the validator's own record. Up to {widest} transactions sit between two")
