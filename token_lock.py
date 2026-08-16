@@ -145,6 +145,15 @@ OFF = {
 #   5VpnWocDjK4DLWbTGD8XZnB6TbBK6VpdfHXYi1QonBKQ
 FIXTURE_LOCK_ADDRESS = "5VpnWocDjK4DLWbTGD8XZnB6TbBK6VpdfHXYi1QonBKQ"
 FIXTURE_LOCK_PROGRAM = "strmRqUCoQUgGUan5YhzUZa6KqdzwX5L6FpUxfmKg5m"
+
+# A real mainnet single-unlock Streamflow lock, still locked, whose depositor
+# CAN cancel it early (cancelable_by_sender = 1). It is the counterexample the
+# self-test's negative controls need, and it is also the account whose escrow
+# is not PDA ["strm", contract] — so it exercises the binding fallback too.
+# Found by census, not by search: see census() below.
+# If it is ever cancelled or withdrawn its account is closed, and the controls
+# that use it will report blocked rather than pass.
+CANCELABLE_CONTROL_LOCK = "7EfRxRTAkF5KDFreMZ3TpVCq3LCSwU1oKxuHKmC75HTv"
 FIXTURE_LOCK_B64 = (
     "BAAAAAAAAAAE/TXzaQAAAAAAAAAAAAAAAAAAAAAAAAAAcd42awAAAAAAAAAAAAAAAHLtGiHP"
     "eO8PBlmfwR5bmcwCWIy1/Z0DWKtBHlpaCFCMLSBlDFhqGrqbcdNuB4Ycg3OOvw27myEpFfWg"
@@ -226,6 +235,39 @@ def derive_escrow(lock_address: str, program_id: str) -> str:
     seeds = [STRM_SEED, lib.b58decode(lock_address)]
     addr, _bump = lib.find_program_address(seeds, lib.b58decode(program_id))
     return lib.b58encode(addr)
+
+
+def check_escrow_binding(lock: dict, url=None) -> tuple:
+    """Second, independent layout control — see check_lock() for why.
+
+    The escrow token account named at offset 209 must be a real SPL token
+    account, hold the mint named at offset 177, and name itself as its own
+    authority. Returns (ok, human-readable detail).
+    """
+    escrow = lock["escrow_tokens"]
+    if not lib.is_valid_pubkey(escrow):
+        return False, f"the bytes at offset {OFF['escrow_tokens']} are not a pubkey"
+    if lib.is_on_curve(lib.b58decode(escrow)):
+        return False, f"{escrow} is ON the ed25519 curve, so it is not a PDA"
+    resp = lib.rpc("getAccountInfo", [escrow, {"encoding": "jsonParsed"}], url=url)
+    value = (resp or {}).get("value")
+    if value is None:
+        return False, f"no account exists at {escrow}"
+    if value["owner"] not in (SPL_TOKEN, SPL_TOKEN_2022):
+        return False, f"{escrow} is owned by {value['owner']}, not a token program"
+    try:
+        info = value["data"]["parsed"]["info"]
+    except (KeyError, TypeError):
+        return False, f"{escrow} is not a parsable token account"
+    if info.get("mint") != lock["mint"]:
+        return False, (f"escrow holds mint {info.get('mint')} but the lock's mint "
+                       f"field says {lock['mint']}")
+    if info.get("owner") != escrow:
+        return False, (f"escrow's authority is {info.get('owner')}, not the escrow "
+                       f"address itself")
+    return True, (f"{escrow} is an off-curve token account, mint "
+                  f"{info['mint']} matches offset {OFF['mint']}, and it is its "
+                  f"own authority; balance {info['tokenAmount']['amount']}")
 
 
 def read_program_authority(program_id: str, url=None) -> dict:
@@ -332,11 +374,21 @@ def upgrade_history(programdata: str, url=None) -> list:
     # call"). Chunks of 5 get through; the default 25 does not. This is slow on
     # purpose so that the command printed on the site works for a stranger with
     # no API key.
-    txs = lib.rpc_batch(
-        "getTransaction",
-        [[s["signature"], {"encoding": "jsonParsed",
-                           "maxSupportedTransactionVersion": 0}] for s in sigs],
-        url=url, chunk=5)
+    try:
+        txs = lib.rpc_batch(
+            "getTransaction",
+            [[s["signature"], {"encoding": "jsonParsed",
+                               "maxSupportedTransactionVersion": 0}] for s in sigs],
+            url=url, chunk=5)
+    except lib.CheckerError:
+        # Degraded, and labelled as such. The signature list alone still
+        # settles "has this programdata account been written to since it was
+        # first deployed", which is the question the word "immutable" turns
+        # on — it just cannot say which loader instruction each one was. It is
+        # reported as "<not decoded>" rather than guessed at.
+        return [{"signature": s["signature"], "block_time": s.get("blockTime"),
+                 "type": "<not decoded>", "info": {},
+                 "failed": bool(s.get("err"))} for s in sigs]
     events = []
     for sig, tx in zip(sigs, txs):
         if not tx:
@@ -431,6 +483,31 @@ def check_program(program_id, expect_immutable=False, expect_authority=None,
                   file=out)
         print(f"    totals: {counts}", file=out)
 
+        # Has the deployed code actually been REPLACED, or only ever deployed
+        # once? The programdata account is created by the first deploy and its
+        # header records the slot of the most recent one. If that slot is later
+        # than the account's own oldest transaction, the code a stranger runs
+        # today is not the code that was first published — and that holds even
+        # when the endpoint refuses getTransaction and no instruction can be
+        # decoded, which is why it is asserted here and not left to prose.
+        first = min((e["block_time"] for e in events if e["block_time"]),
+                    default=None)
+        last = max((e["block_time"] for e in events if e["block_time"]),
+                   default=None)
+        if first is not None:
+            replaced = bool(info["last_deployed_slot"]) and last != first
+            detail = (
+                f"{'YES' if replaced else 'no'} — programdata first written "
+                f"{datetime.fromtimestamp(first, timezone.utc):%Y-%m-%d}, "
+                f"most recently {datetime.fromtimestamp(last, timezone.utc):%Y-%m-%d}, "
+                f"{len(events)} transactions in total; the loader header records "
+                f"the code running now as deployed at slot "
+                f"{info['last_deployed_slot']}")
+            checks.observe("the deployed code has been replaced since this "
+                           "program was first published", detail)
+            print(f"\n    code replaced since first publication: {detail}",
+                  file=out)
+
     print("", file=out)
     if expect_immutable:
         checks.expect_true(
@@ -486,20 +563,53 @@ def check_lock(lock_address, data=None, program_id=None,
     lock = decode_lock(data)
 
     # --- the control on the decoder itself -------------------------------
+    #
+    # Two independent ways to prove the assumed offsets are the real offsets.
+    # Control A is free and offline but only holds for contracts whose escrow
+    # was created as PDA ["strm", contract]; Streamflow has shipped at least one
+    # other escrow derivation (see check_escrow_binding), and refusing to decode
+    # those would report "cannot check" for accounts that decode perfectly well.
+    # Control B settles those from live state instead. At least one must hold.
     derived = derive_escrow(lock_address, program_id)
     layout_ok = derived == lock["escrow_tokens"]
-    checks.expect_true(
-        "the escrow address stored in the account re-derives as a program "
-        "address from the program ID and the lock's own address (proves these "
-        "bytes really are laid out where this checker assumes)",
-        layout_ok,
-        f'PDA ["strm", {lock_address[:8]}…] = {derived}; '
-        f'field at byte {OFF["escrow_tokens"]} = {lock["escrow_tokens"]}')
-    if not layout_ok:
-        raise lib.CheckerError(
-            "the escrow field does not match the derived escrow address. Either "
-            "this is not the account it claims to be or the layout assumed here "
-            "is wrong. Refusing to report any decoded value.")
+    if layout_ok or offline:
+        checks.expect_true(
+            "the escrow address stored in the account re-derives as a program "
+            "address from the program ID and the lock's own address (proves these "
+            "bytes really are laid out where this checker assumes)",
+            layout_ok,
+            f'PDA ["strm", {lock_address[:8]}…] = {derived}; '
+            f'field at byte {OFF["escrow_tokens"]} = {lock["escrow_tokens"]}')
+        if not layout_ok:
+            raise lib.CheckerError(
+                "the escrow field does not match the derived escrow address, and "
+                "the live cross-check is unavailable offline. Refusing to report "
+                "any decoded value.")
+        layout_control = "PDA re-derivation"
+    else:
+        # Control B — the escrow field names a live token account that agrees
+        # with two OTHER fields of this same account. Three 32-byte fields at
+        # three assumed offsets cannot agree by accident: a misaligned read
+        # would not produce a token account whose own mint equals the bytes 32
+        # earlier and whose own authority equals the bytes naming it.
+        bound, detail = check_escrow_binding(lock, url=url)
+        checks.expect_true(
+            "the escrow address stored in the account names a live token "
+            "account that holds the lock's own mint and is its own authority "
+            "(proves these bytes really are laid out where this checker "
+            "assumes, for a lock whose escrow is not PDA [\"strm\", contract])",
+            bound, detail)
+        if not bound:
+            raise lib.CheckerError(
+                "the escrow field neither re-derives as a program address nor "
+                "names a token account bound to this lock. Either this is not "
+                "the account it claims to be or the layout assumed here is "
+                f"wrong ({detail}). Refusing to report any decoded value.")
+        layout_control = "escrow binding (escrow is not PDA [\"strm\", contract])"
+        print(f'  NOTE: escrow is NOT PDA ["strm", contract] (that would be '
+              f'{derived}).', file=out)
+        print("        Layout confirmed the other way instead, see ASSERTIONS.",
+              file=out)
 
     dec_hint = ""
     print(f"  program          {program_id}"
@@ -508,7 +618,8 @@ def check_lock(lock_address, data=None, program_id=None,
     print(f"  mint             {lock['mint']}", file=out)
     print(f"  depositor        {lock['sender']}", file=out)
     print(f"  beneficiary      {lock['recipient']}", file=out)
-    print(f"  escrow (PDA)     {lock['escrow_tokens']}   re-derived above", file=out)
+    print(f"  escrow           {lock['escrow_tokens']}   "
+          f"(layout control: {layout_control})", file=out)
     print("", file=out)
     print(f"  deposited        {lock['net_amount_deposited']} base units{dec_hint}",
           file=out)
@@ -519,7 +630,11 @@ def check_lock(lock_address, data=None, program_id=None,
     print(f"  fully unlocked   {_ts(lock['end_time'])}", file=out)
     print(f"  release step     every {lock['period']}s, "
           f"{lock['amount_per_period']} base units per step", file=out)
-    single = lock["amount_per_period"] >= lock["net_amount_deposited"]
+    # Same rule the census uses, so the two modes never disagree about a lock:
+    # the whole deposit becomes available at one instant.
+    single = ((lock["end_time"] - lock["start_time"] <= 1
+               or lock["cliff_amount"] >= lock["net_amount_deposited"])
+              and lock["net_amount_deposited"] > 0)
     print(f"  shape            {'single unlock (cliff-style lock)' if single else 'linear vesting'}",
           file=out)
     print(f"  closed           {'yes' if lock['closed'] else 'no'}", file=out)
@@ -787,6 +902,43 @@ def self_test(url=None) -> int:
         except lib.CheckerError:
             record("NEGATIVE: a nonexistent program is rejected", True, True)
 
+        # ---- the escrow-binding fallback, against the live chain ----------
+        print("\nThe escrow-binding layout control (for locks whose escrow is "
+              "not PDA [\"strm\", contract]):")
+
+        # POSITIVE: a real mainnet lock that fails PDA re-derivation but is
+        # still decodable. Before the fallback existed this exited 2.
+        c, res = check_lock(CANCELABLE_CONTROL_LOCK, url=url, out=null)
+        record("a lock whose escrow is not PDA-derived still decodes, via the "
+               "binding control", not c.any_failed and not c.any_blocked)
+        record("its escrow really is NOT PDA [\"strm\", contract] — so the "
+               "fallback path is the one that ran",
+               derive_escrow(CANCELABLE_CONTROL_LOCK,
+                             FIXTURE_LOCK_PROGRAM) != res["lock"]["escrow_tokens"])
+
+        # NEGATIVE, and this is the point of the whole page: the same
+        # assertion that passes on the fixture must FAIL on this one.
+        c, _ = check_lock(CANCELABLE_CONTROL_LOCK, expect_not_cancelable=True,
+                          url=url, out=null)
+        record("NEGATIVE: --expect-not-cancelable FAILS on a real Streamflow "
+               "lock that its depositor can cancel", c.any_failed, True)
+
+        # NEGATIVE: tamper the mint field. The binding control compares three
+        # separate offsets against live state, so this must be caught.
+        bad = dict(res["lock"])
+        bad["mint"] = "So11111111111111111111111111111111111111112"
+        ok, _detail = check_escrow_binding(bad, url=url)
+        record("NEGATIVE: the binding control rejects a lock whose mint field "
+               "disagrees with its escrow's mint", not ok, True)
+
+        # NEGATIVE: an on-curve 'escrow' can have a private key, so it can
+        # never be a valid escrow. Caught before any network call.
+        bad = dict(res["lock"])
+        bad["escrow_tokens"] = "So11111111111111111111111111111111111111112"
+        ok, _detail = check_escrow_binding(bad, url=url)
+        record("NEGATIVE: the binding control rejects an on-curve escrow "
+               "address", not ok, True)
+
     except lib.CheckerError as exc:
         print(f"\n  network controls could not run: {exc}")
         print("  (the offline controls above still ran)")
@@ -800,6 +952,185 @@ def self_test(url=None) -> int:
         return 1
     print("Self-test passed. The negative controls confirm it can fail.")
     return 0
+
+
+# --------------------------------------------------------------------------
+# census — is "no cancel button" a protocol guarantee or a per-lock setting?
+# --------------------------------------------------------------------------
+
+# Two contracts pinned as the census's own control. They sit at opposite
+# values of the flag being counted, and both were confirmed through a
+# completely different code path (full getAccountInfo + decode_lock + the
+# layout controls in check_lock) before being pinned here. If the dataSlice
+# offsets used by the census were wrong, these two rows would not read as
+# stated and the census refuses to report a number.
+CENSUS_CONTROLS = {
+    # non-cancelable single-unlock lock, 500,000,000 tokens, unlocks 2026-12-31
+    "5VpnWocDjK4DLWbTGD8XZnB6TbBK6VpdfHXYi1QonBKQ": {
+        "cancelable_by_sender": 0, "single_unlock": True},
+    # sender-cancelable single-unlock lock, 300,000,000 tokens, unlocks 2027-05-30
+    "7EfRxRTAkF5KDFreMZ3TpVCq3LCSwU1oKxuHKmC75HTv": {
+        "cancelable_by_sender": 1, "single_unlock": True},
+}
+
+# The slice the census reads: start_time (409) through can_topup (462).
+CENSUS_OFF, CENSUS_LEN = 409, 54
+
+
+def _slice_all(program_id, offset, length, url=None):
+    """Every 1104-byte account of a program, sliced. One RPC call."""
+    result = lib.rpc("getProgramAccounts",
+                     [program_id,
+                      {"encoding": "base64",
+                       "dataSlice": {"offset": offset, "length": length},
+                       "filters": [{"dataSize": LOCK_ACCOUNT_LEN}]}],
+                     url=url, timeout=300)
+    if not isinstance(result, list):
+        raise lib.CheckerError(
+            f"getProgramAccounts on {program_id} did not return a list. Some "
+            f"endpoints refuse it for large programs; try another --rpc.")
+    return {a["pubkey"]: base64.b64decode(a["account"]["data"][0]) for a in result}
+
+
+def census(program_id, url=None, out=sys.stdout) -> tuple:
+    """Count, across every lock the program holds, who can cancel.
+
+    The claim class this answers: *"our locks cannot be cancelled"* stated
+    about a platform rather than about one lock. A platform-wide claim is
+    false if a single counterexample exists on chain, and this finds them.
+    """
+    checks = lib.Checks()
+    lib.banner(f"LOCK CENSUS — {program_id}", url=url, stream=out)
+    _require_mainnet(checks, url)
+
+    print("  reading every 1104-byte contract account (one getProgramAccounts "
+          "call per slice, 3 slices)…", file=out)
+    end_times = _slice_all(program_id, OFF["end_time"], 8, url=url)
+    sched = _slice_all(program_id, CENSUS_OFF, CENSUS_LEN, url=url)
+    closed = _slice_all(program_id, OFF["closed"], 1, url=url)
+    keys = set(end_times) & set(sched) & set(closed)
+    checks.expect_true(
+        "the three slices returned the same set of accounts (they are separate "
+        "RPC calls against a moving chain, so they can disagree)",
+        len(keys) == len(end_times) == len(sched) == len(closed),
+        f"{len(end_times)} / {len(sched)} / {len(closed)} accounts, "
+        f"{len(keys)} in common")
+
+    rows = {}
+    for key in keys:
+        buf = sched[key]
+        start, deposited, period, per_period, cliff, cliff_amount = \
+            struct.unpack_from("<QQQQQQ", buf, 0)
+        end = struct.unpack_from("<Q", end_times[key], 0)[0]
+        rows[key] = {
+            "end_time": end, "start_time": start,
+            "net_amount_deposited": deposited, "cliff_amount": cliff_amount,
+            "cancelable_by_sender": buf[OFF["cancelable_by_sender"] - CENSUS_OFF],
+            "cancelable_by_recipient": buf[OFF["cancelable_by_recipient"] - CENSUS_OFF],
+            "transferable_by_sender": buf[OFF["transferable_by_sender"] - CENSUS_OFF],
+            "transferable_by_recipient": buf[OFF["transferable_by_recipient"] - CENSUS_OFF],
+            "can_topup": buf[OFF["can_topup"] - CENSUS_OFF],
+            "closed": closed[key][0],
+            # A "lock" as opposed to a vesting stream: the whole deposit becomes
+            # available at one instant, either because the schedule has no
+            # duration or because the cliff releases all of it.
+            "single_unlock": (end - start <= 1 or cliff_amount >= deposited)
+                             and deposited > 0,
+        }
+
+    # --- the census's control --------------------------------------------
+    # A control account can legitimately vanish: a cancelled or fully withdrawn
+    # contract has its account closed and its rent reclaimed. That is not a
+    # failure of the offsets, so a missing control is recorded as blocked. A
+    # control that is PRESENT and reads back wrong is a failure, and so is
+    # having no surviving control at all — either way no count is reported.
+    present = 0
+    for address, want in CENSUS_CONTROLS.items():
+        got = rows.get(address)
+        label = (f"control: {address[:8]}… reads back with "
+                 f"cancelable_by_sender={want['cancelable_by_sender']} "
+                 f"(pinned from a full-account decode, so a wrong slice offset "
+                 f"fails here)")
+        if got is None:
+            checks.blocked(label, f"{address} is no longer an open contract "
+                                  f"(closed contracts have their accounts "
+                                  f"reclaimed)")
+            continue
+        present += 1
+        checks.expect_true(
+            label,
+            got["cancelable_by_sender"] == want["cancelable_by_sender"]
+            and got["single_unlock"] == want["single_unlock"],
+            f"cancelable_by_sender={got['cancelable_by_sender']}, "
+            f"single_unlock={got['single_unlock']}")
+    if checks.any_failed or present == 0:
+        raise lib.CheckerError(
+            "the census controls did not hold (or none survives on chain), so "
+            "the slice offsets cannot be trusted. Refusing to report any count.")
+
+    everything = list(rows.values())
+    locks = [r for r in everything if r["single_unlock"]]
+    open_locks = [r for r in locks if not r["closed"]]
+    now = int(datetime.now(timezone.utc).timestamp())
+    live = [r for r in open_locks if r["end_time"] > now]
+
+    def line(label, subset, total):
+        pct = f"{100.0 * len(subset) / total:.2f}%" if total else "—"
+        print(f"    {label:<44} {len(subset):>7}  {pct:>7}", file=out)
+
+    print("", file=out)
+    print(f"  contract accounts (1104 bytes)                 {len(everything):>7}",
+          file=out)
+    print(f"  of those, single-unlock 'lock' shaped          {len(locks):>7}",
+          file=out)
+    print(f"  of those, not yet closed                       {len(open_locks):>7}",
+          file=out)
+    print(f"  of those, still locked (unlock date in future) {len(live):>7}",
+          file=out)
+    print("", file=out)
+    print("  PER-LOCK FLAGS, counted across the single-unlock locks", file=out)
+    print(f"    {'flag':<44} {'count':>7}  {'share':>7}", file=out)
+    for flag in ("cancelable_by_sender", "cancelable_by_recipient",
+                 "transferable_by_sender", "transferable_by_recipient",
+                 "can_topup"):
+        line(flag, [r for r in locks if r[flag]], len(locks))
+    print("", file=out)
+    still = [(k, rows[k]) for k in rows
+             if rows[k]["single_unlock"] and not rows[k]["closed"]
+             and rows[k]["end_time"] > now and rows[k]["cancelable_by_sender"]]
+    still.sort(key=lambda kv: -kv[1]["net_amount_deposited"])
+    print(f"  COUNTEREXAMPLES — locks that are still locked TODAY and whose", file=out)
+    print(f"  depositor can cancel them early: {len(still)}", file=out)
+    for key, row in still:
+        print(f"    {key}  {row['net_amount_deposited']:>18} base units, "
+              f"unlocks {_ts(row['end_time'])}", file=out)
+    print("", file=out)
+
+    print("WHAT THIS CANNOT TELL YOU", file=out)
+    print("-" * 70, file=out)
+    print("  'single unlock' is this checker's reading of the schedule bytes,", file=out)
+    print("  not a type tag the program stores. A contract whose whole deposit", file=out)
+    print("  becomes available at one instant is counted as a lock; anything", file=out)
+    print("  that releases gradually is counted as vesting and excluded. The", file=out)
+    print("  program does not distinguish the two, so neither can this.", file=out)
+    print("  The flags are the values the accounts store. That the program", file=out)
+    print("  HONOURS them is a property of compiled code, not decoded here.", file=out)
+    return checks, {
+        "program": program_id,
+        "counted_at": lib.utc_now(),
+        "total_contracts": len(everything),
+        "single_unlock_locks": len(locks),
+        "open_locks": len(open_locks),
+        "still_locked": len(live),
+        "flag_counts": {flag: sum(r[flag] for r in locks)
+                        for flag in ("cancelable_by_sender",
+                                     "cancelable_by_recipient",
+                                     "transferable_by_sender",
+                                     "transferable_by_recipient", "can_topup")},
+        "counterexamples": [
+            {"address": k, "net_amount_deposited": r["net_amount_deposited"],
+             "unlocks": _ts(r["end_time"])} for k, r in still],
+    }
 
 
 # --------------------------------------------------------------------------
@@ -828,6 +1159,14 @@ def main() -> int:
                         help="assert the locked token's mint")
     parser.add_argument("--upgrade-history", action="store_true",
                         help="list every deploy/upgrade/authority change")
+    parser.add_argument("--census", metavar="PROGRAM_ID",
+                        help="count, across every lock this program holds, how "
+                             "many can be cancelled early. Settles a claim made "
+                             "about a platform rather than about one lock. Needs "
+                             "getProgramAccounts.")
+    parser.add_argument("--expect-none-cancelable", action="store_true",
+                        help="with --census: assert NO single-unlock lock can be "
+                             "cancelled by its depositor")
     parser.add_argument("--rpc", metavar="URL", help="a Solana RPC endpoint")
     parser.add_argument("--json", metavar="PATH", help="write the facts as JSON")
     parser.add_argument("--self-test", action="store_true",
@@ -839,13 +1178,24 @@ def main() -> int:
     if args.self_test:
         return self_test(url=url)
 
-    if not args.address and not args.program:
+    if not args.address and not args.program and not args.census:
         parser.print_help()
-        print("\nGive a lock address, or --program <ID>, or --self-test.")
+        print("\nGive a lock address, or --program <ID>, or --census <ID>, "
+              "or --self-test.")
         return 2
 
     try:
-        if args.program:
+        if args.census:
+            checks, facts = census(args.census, url=url)
+            if args.expect_none_cancelable:
+                count = facts["flag_counts"]["cancelable_by_sender"]
+                checks.expect_true(
+                    "no single-unlock lock held by this program can be "
+                    "cancelled early by its depositor",
+                    count == 0,
+                    f"{count} of {facts['single_unlock_locks']} carry "
+                    f"cancelable_by_sender = 1")
+        elif args.program:
             checks, facts = check_program(
                 args.program,
                 expect_immutable=args.expect_program_immutable,
