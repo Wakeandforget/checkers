@@ -50,6 +50,7 @@ Exit codes
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 # Allow both "python3 checkers/multisig.py" and "python3 -m checkers.multisig"
@@ -74,6 +75,29 @@ SQUADS_PROGRAM = "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"
 # checker that only understands v4 will look at a live v3 multisig and report
 # "this is not a Squads multisig", which is a wrong answer, not a safe one.
 SQUADS_V3_PROGRAM = "SMPLecH534NA9acpos4G6x7uf3LWbCAwZQE9e8ZekMu"
+
+# How big a v3 `Ms` account is before its member list. Straight from the
+# program's own source — Squads-Protocol/squads-mpl,
+# `programs/squads-mpl/src/state.rs`, `impl Ms { pub const SIZE_WITHOUT_MEMBERS }`:
+#
+#     8 discriminator + 2 threshold + 2 authority_index + 4 transaction_index
+#   + 4 ms_change_index + 1 bump + 32 create_key + 1 allow_external_execute
+#   + 4 vec length                                                    = 58
+#
+# So a well-formed account is 58 + 32 * capacity bytes, and capacity is >= the
+# number of members, never equal to it by any rule. `add_member` (lib.rs:105-110)
+# reallocs "space for 10 more keys" — 320 bytes — whenever the last spare slot
+# is taken, and `remove_member` shrinks the vector without shrinking the
+# account. Spare slots are therefore the ordinary state of a live v3 multisig.
+#
+# WAKE 15 CORRECTION. Until this wake the v3 path asserted that ZERO bytes were
+# left over, and returned exit 1 — "an assertion is false" — for any v3 multisig
+# with room to grow. Sanctum's happened to be sized exactly, so wake 3 passed and
+# the bug hid; Streamflow's (F8aHkn9zir2Yx2jQbm3QSvRKuibib1WDPKBmPuoXNP8D, 538
+# bytes = 58 + 32x15, five members, ten spare slots) failed in wake 10, and four
+# consecutive wakes deferred the fix. It was the worst kind of wrong: a checker
+# reporting a false claim where the claim was fine and the checker was not.
+MS_SIZE_WITHOUT_MEMBERS = 58
 
 # The Anchor/Serum example multisig ("serum-multisig", now coral-xyz/multisig).
 # Not a Squads product at all — a separate, much simpler program that a great
@@ -225,6 +249,17 @@ def decode_multisig_v3(data: bytes) -> dict:
     decoded["configAuthority"] = None       # cannot exist in v3
     decoded["timeLock"] = None              # not a v3 feature
     decoded["trailingBytes"] = cursor.remaining
+
+    # Spare member slots. A v3 account is NOT sized exactly to its member list:
+    # `add_member` grows it ten slots at a time and `remove_member` never
+    # shrinks it, so slack is the normal state, not a warning sign. See the
+    # note on MS_SIZE_WITHOUT_MEMBERS. What must hold is that the slack is a
+    # whole number of 32-byte member slots — a wrong layout would land
+    # off-slot with probability 31/32.
+    decoded["accountBytes"] = len(data)
+    spare = len(data) - MS_SIZE_WITHOUT_MEMBERS - 32 * member_count
+    decoded["spareMemberSlots"] = spare // 32 if spare >= 0 else None
+    decoded["slotAligned"] = spare >= 0 and spare % 32 == 0
     return decoded
 
 
@@ -482,6 +517,348 @@ def resolve_program_control(program_id: str, signer_address: str, url=None) -> d
         "immutable": authority is None,
         "controlled": authority is not None and authority == signer_address,
     }
+
+
+# ---------------------------------------------------------------------------
+# The other direction: "who can upgrade this program?"
+# ---------------------------------------------------------------------------
+#
+# resolve_program_control() answers "does MY multisig control program X". That
+# assumes you already know the controller. The commoner reader question is the
+# reverse and has no multisig in it at all: a docs page names an address as the
+# upgrade authority, and the reader wants to know (a) whether that is still the
+# address on chain and (b) what KIND of thing it is — one keypair somebody
+# carries, a multisig vault, a governance program. Those are different risks
+# and they are routinely described in the same sentence.
+
+# The BPF Upgradeable Loader's instruction enum, from the loader's own source
+# (agave, `sdk/program/src/loader_upgradeable_instruction.rs`). Only the tag —
+# a u32 little-endian at offset 0 — is needed to tell these apart.
+LOADER_IX_NAMES = {
+    0: "InitializeBuffer",
+    1: "Write",
+    2: "DeployWithMaxDataLen",
+    3: "Upgrade",
+    4: "SetAuthority",
+    5: "Close",
+    6: "ExtendProgram",
+    7: "SetAuthorityChecked",
+}
+
+# Which account index carries the NEW authority, and which carries the signing
+# authority, for the instructions that move control. From the same source.
+LOADER_IX_AUTHORITY_SLOTS = {
+    # tag: (index of current/signing authority, index of new authority or None)
+    2: (7, None),    # DeployWithMaxDataLen: [payer, programdata, program, buffer,
+                     #                        rent, clock, system, authority]
+    3: (6, None),    # Upgrade: [programdata, program, buffer, spill, rent, clock, authority]
+    4: (1, 2),       # SetAuthority: [programdata, current authority, new authority?]
+    7: (1, 2),       # SetAuthorityChecked: [programdata, current authority, new authority]
+}
+
+
+def classify_authority(address: str, url=None) -> dict:
+    """What KIND of account is this upgrade authority?
+
+    The distinction that matters to a reader:
+
+      * on the ed25519 curve  -> a keypair exists for it. One signature is
+        enough. Whoever holds that file can replace the program's code.
+      * off the curve         -> a program-derived address. No private key can
+        exist; only the owning program can sign, so control is whatever that
+        program's rules are (a Squads threshold, a governance vote, a timelock).
+
+    An address with no account at all is still a perfectly good signer: a
+    keypair that has never been funded holds nothing and appears nowhere until
+    it signs. So "no account" is reported, not treated as an error.
+    """
+    raw = lib.parse_pubkey(address)
+    on_curve = lib.is_on_curve(raw)
+    try:
+        account = lib.get_account(address, url=url)
+    except lib.CheckerError:
+        account = None
+
+    owner = account["owner"] if account else None
+    family = SQUADS_PROGRAMS.get(owner)
+
+    if on_curve:
+        kind = ("plain keypair (System-owned account)" if account
+                else "plain keypair (no account on chain — never funded)")
+        single_signature = True
+    elif family:
+        kind = f"account owned by {FAMILY_NAMES[family]}"
+        single_signature = False
+    elif owner is None:
+        # Off the curve with no account of its own. This is the ordinary shape
+        # of a signing PDA: a program signs for it with invoke_signed and the
+        # address never needs to hold anything. Which program can sign is NOT
+        # readable from the address — it has to be re-derived, which is what
+        # --find-multisig does. Saying "nothing can sign for it" here would be
+        # a confident false statement, so this says what is actually known.
+        kind = ("program-derived address with no account of its own — some "
+                "program can sign for it with invoke_signed; which program "
+                "cannot be read off the address (try --find-multisig)")
+        single_signature = False
+    elif owner == lib.SYSTEM_PROGRAM:
+        kind = "off-curve, System-owned (a PDA whose program has not claimed it)"
+        single_signature = False
+    else:
+        kind = f"off-curve, owned by program {owner}"
+        single_signature = False
+
+    return {
+        "address": address,
+        "onCurve": on_curve,
+        "exists": account is not None,
+        "owner": owner,
+        "dataLen": len(account["data"]) if account else 0,
+        "lamports": account["lamports"] if account else 0,
+        "multisigFamily": family,
+        "kind": kind,
+        "singleSignatureSuffices": single_signature,
+    }
+
+
+def program_authority_history(program_data_address: str, limit: int = 40,
+                              url=None) -> list:
+    """Every deploy, upgrade and authority handover this program has seen.
+
+    Read from the transactions that touched the ProgramData account, decoded
+    from the raw instruction bytes — the 4-byte instruction tag and the account
+    list — rather than from any RPC-side parser or explorer label.
+
+    This exists to be a SECOND, independent source for the current upgrade
+    authority. The account says who it is; the history says who it was set to
+    and when. If those two disagree, something in this checker is wrong, and a
+    reader should be told rather than shown a confident single number.
+    """
+    signatures = lib.rpc("getSignaturesForAddress",
+                         [program_data_address, {"limit": limit}], url=url)
+    if not signatures:
+        return []
+
+    params = [[s["signature"], {"encoding": "json",
+                                "maxSupportedTransactionVersion": 0}]
+              for s in signatures]
+    # Small batches on purpose: the free public endpoint rate-limits
+    # getTransaction hard, and a checker a stranger cannot run is not a checker.
+    transactions = lib.rpc_batch("getTransaction", params, url=url, chunk=8)
+
+    events = []
+    for meta_sig, tx in zip(signatures, transactions):
+        if tx is None:
+            events.append({"signature": meta_sig["signature"],
+                           "slot": meta_sig.get("slot"),
+                           "blockTime": meta_sig.get("blockTime"),
+                           "instruction": None,
+                           "note": "the endpoint no longer has this transaction"})
+            continue
+
+        message = tx["transaction"]["message"]
+        keys = list(message["accountKeys"])
+        loaded = (tx.get("meta") or {}).get("loadedAddresses") or {}
+        keys += list(loaded.get("writable") or []) + list(loaded.get("readonly") or [])
+        failed = (tx.get("meta") or {}).get("err") is not None
+
+        for instruction in message["instructions"]:
+            program = keys[instruction["programIdIndex"]]
+            if program != spl_mint.BPF_UPGRADEABLE_LOADER:
+                continue
+            data = lib.b58decode(instruction["data"])
+            if len(data) < 4:
+                continue
+            tag = int.from_bytes(data[:4], "little")
+            accounts = [keys[i] for i in instruction["accounts"]]
+            if program_data_address not in accounts:
+                continue
+
+            signer_slot, new_slot = LOADER_IX_AUTHORITY_SLOTS.get(tag, (None, None))
+            events.append({
+                "signature": meta_sig["signature"],
+                "slot": tx.get("slot", meta_sig.get("slot")),
+                "blockTime": tx.get("blockTime", meta_sig.get("blockTime")),
+                "instruction": LOADER_IX_NAMES.get(tag, f"unknown tag {tag}"),
+                "tag": tag,
+                "failed": failed,
+                "signingAuthority": (accounts[signer_slot]
+                                     if signer_slot is not None
+                                     and signer_slot < len(accounts) else None),
+                # SetAuthority with the third account omitted revokes the
+                # authority outright: the program becomes immutable. That is a
+                # real, meaningful "None" and is not the same as "not decoded".
+                "newAuthority": (accounts[new_slot]
+                                 if new_slot is not None and new_slot < len(accounts)
+                                 else (None if tag in (4, 7) else "n/a")),
+                "accounts": accounts,
+            })
+    return events
+
+
+def _stamp(block_time) -> str:
+    if not block_time:
+        return "unknown time"
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(block_time))
+
+
+def check_program_authority(program_id: str, expect_authorities=None,
+                            expect_single_key: bool = False,
+                            expect_immutable: bool = False,
+                            history: int = 0, url=None, quiet: bool = False):
+    """"Who can upgrade program X?" — decoded, classified and cross-checked."""
+    out = sys.stderr if quiet else sys.stdout
+    checks = lib.Checks()
+
+    if not quiet:
+        lib.banner(f"PROGRAM UPGRADE AUTHORITY — {program_id}", url=url, stream=out)
+
+    genesis = lib.rpc("getGenesisHash", [], url=url)
+    if genesis != MAINNET_GENESIS:
+        raise lib.CheckerError(
+            f"this endpoint reports genesis hash {genesis}, which is not "
+            f"Solana mainnet-beta ({MAINNET_GENESIS})."
+        )
+    checks.expect("the endpoint really is Solana mainnet-beta (genesis hash)",
+                  genesis, MAINNET_GENESIS)
+
+    info = spl_mint.program_upgrade_authority(program_id, url=url)
+    program_data = info.get("programDataAddress")
+
+    # The Program account points at its ProgramData account. Believing that
+    # pointer is believing one field of the account we are auditing. The loader
+    # also fixes the address by derivation — seeds [program_id] — so it can be
+    # recomputed from nothing but the program id and checked against the
+    # pointer. If they ever disagreed, the bytes being read would not be this
+    # program's.
+    if program_data:
+        derived_raw, _bump = lib.find_program_address(
+            [lib.parse_pubkey(program_id)],
+            lib.parse_pubkey(spl_mint.BPF_UPGRADEABLE_LOADER))
+        derived = lib.b58encode(derived_raw)
+        checks.expect(
+            "the ProgramData address re-derives from the program id alone "
+            "(seeds [program_id] under the BPF Upgradeable Loader), so the "
+            "authority below is read from the right account",
+            program_data, derived)
+
+    authority = info.get("upgradeAuthority")
+    checks.observe("program data account", program_data)
+    checks.observe("last deployed slot", info.get("lastDeployedSlot"))
+    checks.observe("upgrade authority",
+                   authority or "NONE — the program is immutable")
+
+    classification = None
+    if authority:
+        classification = classify_authority(authority, url=url)
+        checks.observe("what kind of account that authority is",
+                       classification["kind"])
+        checks.observe("one signature is enough to upgrade this program",
+                       "yes" if classification["singleSignatureSuffices"] else "no")
+
+    for expected in (expect_authorities or []):
+        checks.expect(f"the upgrade authority is {expected}",
+                      authority or "NONE (immutable)", expected)
+
+    if expect_immutable:
+        checks.expect_true("the program has no upgrade authority at all",
+                           authority is None,
+                           "immutable" if authority is None
+                           else f"upgradeable by {authority}")
+
+    if expect_single_key:
+        checks.expect_true(
+            "the upgrade authority is a plain keypair — on the ed25519 curve, "
+            "so a private key for it exists and one signature can replace the "
+            "program's code",
+            bool(classification and classification["onCurve"]),
+            "no authority at all (immutable)" if not classification
+            else f"{classification['kind']}",
+        )
+        checks.expect_true(
+            "no program stands between that key and an upgrade (the authority "
+            "is not owned by a multisig, governance or timelock program)",
+            bool(classification and classification["onCurve"]
+                 and classification["owner"] in (None, lib.SYSTEM_PROGRAM)),
+            "immutable" if not classification
+            else f"owner is {classification['owner'] or 'no account'}",
+        )
+
+    events = []
+    if history:
+        events = program_authority_history(program_data, limit=history, url=url)
+        control_events = [e for e in events if e.get("instruction")
+                          and not e.get("failed")]
+        handovers = [e for e in control_events if e["tag"] in (4, 7)]
+        upgrades = [e for e in control_events if e["tag"] in (2, 3)]
+        checks.observe(f"loader instructions decoded from the last {history} "
+                       "transactions touching the program data account",
+                       len(control_events))
+
+        # Two reconciliations. Each pits the account's own fields against a
+        # completely different source — the transaction log — and neither can
+        # see the other.
+        if handovers:
+            newest = handovers[0]
+            checks.expect(
+                "the most recent successful SetAuthority in the transaction "
+                "history names the same authority the account reports (two "
+                "independent sources for the same fact)",
+                newest["newAuthority"] or "NONE (revoked)",
+                authority or "NONE (revoked)")
+            checks.observe("authority last changed",
+                           f"{_stamp(newest['blockTime'])} in {newest['signature']}")
+        if upgrades:
+            checks.expect(
+                "the slot of the most recent successful deploy/upgrade "
+                "transaction equals the last-deployed slot stored in the "
+                "program data account",
+                upgrades[0]["slot"], info.get("lastDeployedSlot"))
+            checks.observe("code last replaced",
+                           f"{_stamp(upgrades[0]['blockTime'])} in "
+                           f"{upgrades[0]['signature']}")
+
+    if not quiet:
+        print("", file=out)
+        print("WHO CAN UPGRADE THIS PROGRAM", file=out)
+        print("-" * 70, file=out)
+        if authority is None:
+            print("  Nobody. The upgrade authority has been revoked.", file=out)
+        else:
+            print(f"  {authority}", file=out)
+            print(f"  {classification['kind']}", file=out)
+            print(f"  on the ed25519 curve: {classification['onCurve']}   "
+                  f"account exists: {classification['exists']}   "
+                  f"owner: {classification['owner'] or 'n/a'}", file=out)
+        if events:
+            print("", file=out)
+            print("LOADER HISTORY (newest first, decoded from instruction bytes)",
+                  file=out)
+            print("-" * 70, file=out)
+            for event in events:
+                if not event.get("instruction"):
+                    continue
+                line = (f"  {_stamp(event['blockTime'])}  slot {event['slot']}  "
+                        f"{event['instruction']}")
+                if event["tag"] in (4, 7):
+                    line += f" -> {event['newAuthority'] or 'REVOKED (immutable)'}"
+                if event.get("failed"):
+                    line += "   [transaction FAILED — no effect]"
+                print(line, file=out)
+                print(f"      signed by {event['signingAuthority']}", file=out)
+                print(f"      {event['signature']}", file=out)
+
+    facts = {
+        "programId": program_id,
+        "programDataAddress": program_data,
+        "lastDeployedSlot": info.get("lastDeployedSlot"),
+        "upgradeAuthority": authority,
+        "authorityClassification": classification,
+        "expectedAuthorities": list(expect_authorities or []),
+        "history": events,
+        "checkedAt": lib.utc_now(),
+        "assertions": checks.rows,
+    }
+    return checks, facts
 
 
 def find_multisig_for_authority(authority_address: str, version: str = "v3",
@@ -790,13 +1167,29 @@ def check(address, expect_threshold=None, expect_members=None, vault_index=None,
             f"(bump {rederived_bump}); account is {address} (stored bump "
             f"{multisig['bump']})",
         )
+        # The account is allocated with room to grow the member list, ten slots
+        # at a time, so leftover bytes are normal here and prove nothing on
+        # their own. What DOES have to hold is that the whole account is
+        # 58 + 32 x capacity bytes with capacity >= the member count: every
+        # leftover byte must belong to an unused member slot. That is a real
+        # structural assertion — a wrong layout misses the 32-byte grid 31
+        # times out of 32 — and unlike the old "leftover must be zero" test it
+        # is true of every well-formed v3 account rather than only the ones
+        # that happen to be full.
+        members_n = len(multisig["members"])
         checks.expect_true(
-            "every byte of the account is accounted for by the assumed layout "
-            "(no trailing slack that a wrong layout could be hiding in)",
-            multisig["trailingBytes"] == 0,
-            f"{multisig['trailingBytes']} bytes left over after decoding "
-            f"{len(multisig['members'])} members",
+            "the account size is exactly 58 + 32 x capacity bytes and capacity "
+            "is at least the member count (every leftover byte is an unused "
+            "member slot, not slack a wrong layout could hide in)",
+            multisig["slotAligned"],
+            f"{multisig['accountBytes']} bytes = {MS_SIZE_WITHOUT_MEMBERS} + 32 x "
+            f"{(multisig['accountBytes'] - MS_SIZE_WITHOUT_MEMBERS) / 32:g} "
+            f"for {members_n} members"
+            + (f", {multisig['spareMemberSlots']} slot(s) spare"
+               if multisig["slotAligned"] else " — NOT on the 32-byte grid"),
         )
+        checks.observe("spare member slots (room to add members without a realloc)",
+                       multisig["spareMemberSlots"])
 
     if version == "serum":
         # The signer PDA above was derived with the nonce stored in the account,
@@ -1001,6 +1394,19 @@ V3_CREATE_KEY = "CLniPncNVFynHfyfAQLpizZhrqVpQEs8UuJQ9db4epAF"
 
 # A program that program-control assertions should confirm is under V3_AUTHORITY.
 V3_CONTROLLED_PROGRAM = "SP12tWFxD9oJsVWNavTTBZvMbA6gkAmxtVgxdqvyvhY"
+
+# A live Squads v3 multisig with SPARE member capacity: Streamflow's, holding
+# the upgrade authority of both Streamflow programs (found in wake 10 by
+# exhaustive search). 538 bytes = 58 + 32 x 15, five members, ten empty slots.
+# This is the account the v3 path used to fail on. It is here so that the
+# regression cannot come back unnoticed.
+V3_SPARE_MULTISIG = "F8aHkn9zir2Yx2jQbm3QSvRKuibib1WDPKBmPuoXNP8D"
+
+# A program with a long, varied loader history — deploys, upgrades and many
+# authority handovers — used to prove that the history decoder's account
+# positions are load-bearing. Solend's lending program: 77 loader instructions
+# since 2021, including 27 authority changes.
+HISTORY_PROGRAM = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"
 
 # A program with NO upgrade authority at all. Claiming a multisig controls it
 # must fail — "immutable" is not "controlled by you", however safe it sounds.
@@ -1398,6 +1804,135 @@ def self_test(url=None) -> int:
         record("KNOWN-BAD: a non-proposal account is refused as a proposal",
                True, f"refused with: {str(exc)[:90]}")
 
+    # -- Control 29: online, POSITIVE. THE REGRESSION THIS WAKE FIXED. A live
+    #    Squads v3 multisig with spare member capacity must decode and pass.
+    #    Until wake 15 this returned exit 1 — "an assertion is false" — for a
+    #    perfectly well-formed account, because the v3 path demanded that zero
+    #    bytes be left over. Streamflow's multisig is 538 bytes = 58 + 32 x 15
+    #    with five members, so ten slots are empty and always will be until
+    #    somebody joins.
+    try:
+        checks, facts = check(V3_SPARE_MULTISIG, url=url, quiet=True)
+        code = checks.exit_code()
+        decoded = facts["multisig"]
+        spare = decoded["spareMemberSlots"]
+        record("KNOWN-GOOD: a live v3 multisig with SPARE member slots passes "
+               "(the wake-15 regression)",
+               code == 0 and facts["squadsVersion"] == "v3" and spare and spare > 0,
+               f"exit code {code} (wanted 0), {decoded['accountBytes']} bytes, "
+               f"{len(decoded['members'])} members, {spare} spare slot(s)")
+    except lib.CheckerError as exc:
+        record("KNOWN-GOOD: a live v3 multisig with SPARE member slots passes "
+               "(the wake-15 regression)", False, str(exc), blocked=True)
+
+    # -- Control 30: offline, NEGATIVE. The replacement assertion must still
+    #    bite. An Ms account whose length is not 58 + 32k cannot be explained
+    #    by unused member slots, and the decoder must say so instead of
+    #    shrugging at leftover bytes the way the serum path legitimately does.
+    try:
+        body = (lib.anchor_discriminator("Ms")
+                + (2).to_bytes(2, "little")      # threshold
+                + (1).to_bytes(2, "little")      # authority_index
+                + (0).to_bytes(4, "little")      # transaction_index
+                + (0).to_bytes(4, "little")      # ms_change_index
+                + bytes([255])                   # bump
+                + bytes(32)                      # create_key
+                + bytes([0])                     # allow_external_execute
+                + (1).to_bytes(4, "little")      # one member
+                + bytes(32))                     # that member
+        aligned = decode_multisig_v3(body + bytes(64))     # two empty slots
+        skewed = decode_multisig_v3(body + bytes(64) + bytes(5))  # 5 bytes off-grid
+        record("KNOWN-BAD: an Ms account that is not 58 + 32k bytes fails the "
+               "size assertion, while a whole number of spare slots passes",
+               aligned["slotAligned"] and not skewed["slotAligned"],
+               f"58+32x3 -> slotAligned={aligned['slotAligned']} "
+               f"(spare {aligned['spareMemberSlots']}); "
+               f"5 bytes over -> slotAligned={skewed['slotAligned']}")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: an Ms account that is not 58 + 32k bytes fails the "
+               "size assertion, while a whole number of spare slots passes",
+               False, str(exc))
+
+    # -- Control 31: online, POSITIVE. --program mode on a program known to be
+    #    controlled by a Squads v3 authority: the authority must come back
+    #    exactly, and must be classified as off-curve rather than as a keypair.
+    try:
+        checks, facts = check_program_authority(
+            V3_CONTROLLED_PROGRAM, expect_authorities=[V3_AUTHORITY],
+            url=url, quiet=True)
+        code = checks.exit_code()
+        classification = facts["authorityClassification"]
+        record("KNOWN-GOOD: --program resolves a multisig-controlled program "
+               "and classifies its authority as off-curve",
+               code == 0 and classification and not classification["onCurve"],
+               f"exit code {code} (wanted 0), authority "
+               f"{facts['upgradeAuthority']}, onCurve "
+               f"{classification and classification['onCurve']} (wanted False)")
+    except lib.CheckerError as exc:
+        record("KNOWN-GOOD: --program resolves a multisig-controlled program "
+               "and classifies its authority as off-curve",
+               False, str(exc), blocked=True)
+
+    # -- Control 32: online, NEGATIVE. The same program with --expect-single-key
+    #    must FAIL. A PDA is not a keypair, and a checker that cannot tell them
+    #    apart cannot answer the question this mode exists for.
+    try:
+        checks, _ = check_program_authority(
+            V3_CONTROLLED_PROGRAM, expect_single_key=True, url=url, quiet=True)
+        code = checks.exit_code()
+        record("KNOWN-BAD: claiming a PDA-controlled program is under a single "
+               "keypair produces exit 1",
+               code == 1, f"exit code {code} (wanted 1)")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: claiming a PDA-controlled program is under a single "
+               "keypair produces exit 1", False, str(exc), blocked=True)
+
+    # -- Control 33: online, NEGATIVE. An immutable program has no authority at
+    #    all, so any --expect-authority must fail. "Nobody can upgrade it" is
+    #    not "your key can upgrade it", however much safer it sounds.
+    try:
+        checks, facts = check_program_authority(
+            IMMUTABLE_PROGRAM, expect_authorities=[V3_AUTHORITY],
+            url=url, quiet=True)
+        code = checks.exit_code()
+        record("KNOWN-BAD: an authority claimed for an immutable program fails",
+               code == 1 and facts["upgradeAuthority"] is None,
+               f"exit code {code} (wanted 1), authority "
+               f"{facts['upgradeAuthority']} (wanted None)")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: an authority claimed for an immutable program fails",
+               False, str(exc), blocked=True)
+
+    # -- Control 34: online. THE ONE THAT MAKES THE HISTORY WORTH READING.
+    #    The loader history is decoded from raw instruction bytes: a 4-byte tag
+    #    and a fixed account position. Read the new authority from the wrong
+    #    account slot and the answer changes — so if the slot were wrong, the
+    #    reconciliation against the account's own upgrade-authority field could
+    #    not hold. This control proves the slot is load-bearing rather than
+    #    decorative, by doing it wrong on purpose against live data.
+    try:
+        info = spl_mint.program_upgrade_authority(HISTORY_PROGRAM, url=url)
+        events = program_authority_history(info["programDataAddress"],
+                                           limit=6, url=url)
+        handovers = [e for e in events
+                     if e.get("tag") in (4, 7) and not e.get("failed")]
+        if not handovers:
+            record("KNOWN-BAD: reading the new authority from the wrong account "
+                   "slot breaks the reconciliation", False,
+                   "no authority handover found in the last 6 transactions",
+                   blocked=True)
+        else:
+            right = handovers[0]["newAuthority"]
+            wrong_slot = handovers[0]["accounts"][1]      # the SIGNER, not the new authority
+            record("KNOWN-BAD: reading the new authority from the wrong account "
+                   "slot breaks the reconciliation",
+                   right == info["upgradeAuthority"] and wrong_slot != right,
+                   f"slot 2 gives {right} which matches the account's own field; "
+                   f"slot 1 gives {wrong_slot}, which does not")
+    except lib.CheckerError as exc:
+        record("KNOWN-BAD: reading the new authority from the wrong account "
+               "slot breaks the reconciliation", False, str(exc), blocked=True)
+
     # -- Verdict ------------------------------------------------------------
     wrong = [r for r in results if not r["ok"] and not r["blocked"]]
     blocked = [r for r in results if r["blocked"]]
@@ -1451,6 +1986,29 @@ def main() -> int:
                              "multisig and report how many owners actually "
                              "approved it. Anchor/Serum multisigs only. "
                              "Repeatable.")
+    parser.add_argument("--program", metavar="PROGRAM_ID",
+                        help="reverse mode: instead of starting from a "
+                             "multisig, start from a program and report WHO "
+                             "can upgrade it and what kind of account that "
+                             "authority is (keypair, multisig vault, PDA).")
+    parser.add_argument("--expect-authority", metavar="ADDRESS",
+                        action="append", dest="expect_authorities",
+                        help="with --program: assert the upgrade authority is "
+                             "this address. Repeatable — a docs page that names "
+                             "two different authorities gets both tested.")
+    parser.add_argument("--expect-single-key", action="store_true",
+                        help="with --program: assert the upgrade authority is a "
+                             "plain keypair on the ed25519 curve, with no "
+                             "program standing between it and an upgrade.")
+    parser.add_argument("--expect-immutable", action="store_true",
+                        help="with --program: assert the program has no upgrade "
+                             "authority at all.")
+    parser.add_argument("--history", type=int, nargs="?", const=40, default=0,
+                        metavar="N",
+                        help="with --program: decode the last N transactions "
+                             "touching the program data account (default 40) "
+                             "and report every deploy, upgrade and authority "
+                             "handover, from the raw instruction bytes.")
     parser.add_argument("--find-multisig", metavar="AUTHORITY",
                         help="search mode: given a signing PDA, find the multisig "
                              "it belongs to by enumerating every Squads multisig "
@@ -1470,6 +2028,34 @@ def main() -> int:
 
     if args.self_test:
         return self_test(url=args.rpc)
+
+    if args.program:
+        try:
+            checks, facts = check_program_authority(
+                args.program,
+                expect_authorities=args.expect_authorities,
+                expect_single_key=args.expect_single_key,
+                expect_immutable=args.expect_immutable,
+                history=args.history,
+                url=args.rpc,
+            )
+        except lib.CheckerError as exc:
+            print(f"\nCOULD NOT CHECK: {exc}")
+            return 2
+        checks.print_report()
+        if args.json:
+            Path(args.json).write_text(
+                json.dumps(facts, indent=2, sort_keys=True), encoding="utf-8")
+            print(f"\nwrote {args.json}")
+        code = checks.exit_code()
+        print("")
+        if code == 0:
+            print("RESULT: every assertion held.")
+        elif code == 1:
+            print("RESULT: at least one assertion is FALSE. See the FAIL lines above.")
+        else:
+            print("RESULT: incomplete — something could not be checked.")
+        return code
 
     if args.find_multisig:
         print(f"Searching Squads {args.find_version} for the multisig whose signing "

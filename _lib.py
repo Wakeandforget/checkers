@@ -337,6 +337,12 @@ def rpc(method: str, params, url: str = None, timeout: int = 25, attempts: int =
     )
 
 
+# JSON-RPC error codes that mean "ask again in a moment", not "the answer is
+# no". 429 is the public endpoint's rate limiter; -32005 is a node reporting it
+# is behind or overloaded; -32004 is a block not available yet.
+RETRYABLE_RPC_CODES = {429, -32004, -32005}
+
+
 def rpc_batch(method: str, params_list, url: str = None, timeout: int = 60,
               attempts: int = 7, chunk: int = 25, progress=None):
     """Make the same call many times, batched, and return the results in order.
@@ -396,6 +402,27 @@ def rpc_batch(method: str, params_list, url: str = None, timeout: int = 60,
                         f"{len(window)} results in one batch and got "
                         f"{len(payload)}."
                     )
+                # A rate-limit refusal arrives INSIDE the batch reply, as a
+                # per-call error, not as an HTTP 429. Treating that like a real
+                # refusal ends the walk on a condition that clears itself in a
+                # second, which is how the free public endpoint turns a working
+                # checker into one a stranger cannot run. Back off and retry the
+                # whole window; only give up when the attempts are exhausted.
+                transient = next(
+                    (item["error"] for item in payload
+                     if item.get("error", {}).get("code") in RETRYABLE_RPC_CODES),
+                    None)
+                if transient is not None:
+                    last_error = f"{transient}"
+                    if attempt < attempts:
+                        time.sleep(min(2 ** attempt, 30))
+                        continue
+                    raise CheckerError(
+                        f"RPC {method} kept being rate-limited by "
+                        f"{mask_url(endpoint)} after {attempts} attempts: "
+                        f"{transient}"
+                    )
+
                 by_id = {}
                 for item in payload:
                     if "error" in item:
